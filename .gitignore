@@ -1,8 +1,7 @@
 # Compressed files
-*.tar.gz
-*.zipnode_modules/
+*.zip
+*.tar.gznode_modules/
 .next/
 dist/
 build/
 *.log
-node_modules/
