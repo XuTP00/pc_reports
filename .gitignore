@@ -1,8 +1,7 @@
-(empty)node_modules/
+# Compressed files
+*.tar.gz
+*.zipnode_modules/
 .next/
 dist/
 build/
 *.log
-node_modules/
-pc-report.zip
-pc-report.tar.gz
