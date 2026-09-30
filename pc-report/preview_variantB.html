@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PC Report — c-6abcc30f-01ed1602-a5ccf0464326 — 30.09.2026 08:23</title>
+<title>PC Report — c-6abcc30f-01ed1602-a5ccf0464326 — 30.09.2026 08:30</title>
 <style>
 :root{--bg:#0d1117;--panel:#161b22;--panel2:#1c2330;--border:#30363d;--text:#c9d1d9;--dim:#8b949e;
 --blue:#388bfd;--accent:#58a6ff;--green:#3fb950;--amber:#d29922;--red:#f85149;
@@ -53,14 +53,23 @@ pre.term .p{color:var(--accent)}
 footer{margin-top:50px;border-top:1px solid var(--border);padding-top:18px;color:var(--dim);font-size:12px}
 footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
 @media print{body{background:#fff;color:#111}.card{border-color:#bbb;background:#fafafa}}
-.card{border-radius:0}.g2{grid-template-columns:1fr}.sec-title{border-left:4px solid var(--blue);padding-left:12px}.card:hover{transform:none}</style>
+
+/* ===== VARIANT B LAYOUT OVERRIDES ===== */
+.card{border-radius:0;border-left:3px solid var(--blue)}
+.g2{grid-template-columns:1fr}
+.sec-title{border-left:4px solid var(--blue);padding-left:12px}
+.card:hover{transform:none;border-color:var(--border)}
+table{font-size:13.5px}
+th{width:34%;background:#1c2330;color:var(--accent);font-weight:600}
+tr:hover td,tr:hover th{background:#1f2a3d}
+</style>
 </head>
-<body>
+<body><div style="background:#1f6feb;color:#fff;text-align:center;padding:8px;font-size:13px;letter-spacing:2px">ВАРИАНТ B — ТАБЛИЧНАЯ РАСКЛАДКА (одна колонка, плотные таблицы)</div>
 <header class="hero"><div class="wrap">
 <h1>PC<span class="dot">▪</span>REPORT</h1>
 <div class="sub">
  <span>КОМПЬЮТЕР: <b>c-6abcc30f-01ed1602-a5ccf0464326</b></span>
- <span>ДАТА ОТЧЁТА: <b>30.09.2026 08:23:33</b></span>
+ <span>ДАТА ОТЧЁТА: <b>30.09.2026 08:30:25</b></span>
  <span>ПОЛЬЗОВАТЕЛЬ: <b>root</b></span>
 </div>
 <div class="badges">
@@ -89,7 +98,7 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
  <div class="card"><h3>Платформа</h3><table>
  <tr><th>Тип окружения</th><td>Контейнер (Docker/Kubernetes/LXC)</td></tr>
  <tr><th>Имя компьютера</th><td>c-6abcc30f-01ed1602-a5ccf0464326</td></tr>
- <tr><th>Загрузка</th><td>2026-09-30 08:06:35, вверх 16 minutes</td></tr>
+ <tr><th>Загрузка</th><td>2026-09-30 08:06:35, вверх 23 minutes</td></tr>
  </table></div>
 </div></div></section>
 
@@ -162,10 +171,10 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
  <tr><th>Блочное устройство (root)</th><td>c-6abcc30f-01ed1602-a5ccf0464326-rootfs</td></tr>
  <tr><th>Файловая система</th><td>overlay</td></tr>
  <tr><th>Общий объём</th><td>9.9G</td></tr>
- <tr><th>Занято</th><td>32M (1%)</td></tr>
- <tr><th>Свободно</th><td>9.3G</td></tr>
+ <tr><th>Занято</th><td>555M (6%)</td></tr>
+ <tr><th>Свободно</th><td>8.8G</td></tr>
  </table>
- <div class="bar"><div class="ok" style="width:1%"></div></div>
+ <div class="bar"><div class="ok" style="width:6%"></div></div>
  </div>
  <div class="card"><h3>Физические диски</h3>
   <table><tr><th>Устройство</th><th>Модель</th><th>Объём</th><th>Тип</th></tr>
@@ -216,12 +225,12 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
 <span class="p">$</span> motherboard   → не определена (DMI недоступен в контейнере/виртуальной среде)
 <span class="p">$</span> ram           → 2.0 GB · 1 module(s)
 <span class="p">$</span> gpu           → Графический адаптер не обнаружен (headless-окружение) · VRAM: н/д (видеопамять не видима из текущего окружения)
-<span class="p">$</span> root disk     → c-6abcc30f-01ed1602-a5ccf0464326-rootfs · 9.9G total · 32M used (1%)
+<span class="p">$</span> root disk     → c-6abcc30f-01ed1602-a5ccf0464326-rootfs · 9.9G total · 555M used (6%)
 <span class="p">$</span> user          → root · all: qwencoder;
 </pre></div></section>
 
 <footer><div class="wrap">
-<span>Отчёт сформирован скриптом pc_report.sh · 30.09.2026 08:23:33</span>
+<span>Отчёт сформирован скриптом pc_report.sh · 30.09.2026 08:30:25</span>
 <span>Хост: c-6abcc30f-01ed1602-a5ccf0464326 · Автономный HTML, без внешних ресурсов</span>
 </div></footer>
 </body></html>
