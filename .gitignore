@@ -4,3 +4,5 @@ dist/
 build/
 *.log
 node_modules/
+pc-report.zip
+pc-report.tar.gz
