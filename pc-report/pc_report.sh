@@ -236,7 +236,7 @@ $(echo "$DISKS" | tr ';' '\n' | awk -F'|' 'NF>=4{printf "<tr><td>%s</td><td>%s</
 <div class="sec-title"><span class="ico">🌐</span><span class="num">07</span> Сетевые интерфейсы</div>
 <div class="grid g2">
 $(echo "$IFACES" | tr ';' '\n' | awk -F'|' 'NF>=6{n++
- st=(($2=="up")?"green":"gray")
+ st=(($2~/up/)?((index($6,"DHCP")>0)?"green":"blue"):"gray")
  printf "<div class=\"card\"><h3>%s <span class=\"pill %s\">%s</span></h3><table>\n", $1, st, $2
  printf "<tr><th>MAC-адрес</th><td>%s</td></tr>\n", $3
  printf "<tr><th>IPv4</th><td>%s</td></tr>\n", $4

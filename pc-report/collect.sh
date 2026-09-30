@@ -14,10 +14,12 @@ OS_NAME=""; OS_VER=""; OS_BUILD=""
 if [ -r /etc/os-release ]; then
   . /etc/os-release
   OS_NAME="${PRETTY_NAME:-${NAME:-Linux}}"
-  OS_VER="${VERSION_ID:-unknown}"
-  OS_BUILD="${VERSION:-}"
+  OS_VER="${VERSION:-${VERSION_ID:-unknown}}"
+  OS_BUILD="${VERSION_CODENAME:-}"
 fi
 [ -n "$OS_NAME" ] || OS_NAME="$(uname -s)"
+# если в имени уже есть кодовое имя в скобках — не дублировать его в версии
+case "$OS_NAME" in *"$OS_BUILD)"*) OS_BUILD="" ;; esac
 KERNEL=$(uname -r)
 ARCH=$(uname -m)
 case "$ARCH" in
