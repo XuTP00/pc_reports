@@ -71,7 +71,7 @@ $gpuCards = @()
 foreach ($g in $gpus) {
   $vramGb = [math]::Round(($g.AdapterRAM / 1GB), 2)
   if ($vramGb -le 0) { $vramTxt = '— (разделяемая)' } else { $vramTxt = "$vramGb ГБ" }
-  $spec = "$($g.VideoProcessor) · DirectX $($g.DeviceVideoMemory)"
+  $spec = "$($g.VideoProcessor)"
   $gpuCards += @"
  <div class="card"><h3>$(Esc $g.Name) <span class="tag">$vramTxt</span></h3><table>
  <tr><th>Полное наименование</th><td>$(Esc $g.Name)</td></tr>
@@ -104,7 +104,7 @@ foreach ($v in $vols) {
  </table><div class="bar"><div class="$cls" style="width:${usedP}%"></div></div></div>
 "@
 }
-if ($volCards.Count -eq 0) { $volCards = @('<div class="card"><h3>Тома</h3><p class="dim">Локальные тома не обнаружены</p></div>')
+if ($volCards.Count -eq 0) { $volCards = @('<div class="card"><h3>Тома</h3><p class="dim">Локальные тома не обнаружены</p></div>') }
 
 # Физические диски
 $pdisks = @(Get-CimInstance Win32_DiskDrive)
@@ -135,11 +135,11 @@ foreach ($n in $nics) {
  </table></div>
 "@
 }
-if ($nicCards.Count -eq 0) { $nicCards = @('<div class="card"><h3>Сеть</h3><p class="dim">Активные интерфейсы не обнаружены</p></div>')
+if ($nicCards.Count -eq 0) { $nicCards = @('<div class="card"><h3>Сеть</h3><p class="dim">Активные интерфейсы не обнаружены</p></div>') }
 
 # ---------- Пользователи ----------
 $userNow  = "$env:USERDOMAIN\$env:USERNAME" -replace '^\\',''
-$allUsers = @(Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True" | Where-Object { $_.SIDType -eq 1 -and -not $_.InheritedFromTemplate })
+$allUsers = @(Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True" | Where-Object { $_.SIDType -eq 1 })
 $userPills = ($allUsers | ForEach-Object { '<span class="pill blue">' + (Esc $_.Name) + '</span>' }) -join ''
 $online = @(Get-CimInstance Win32_LogonSession -Filter 'LogonType=2 OR LogonType=10' -ErrorAction SilentlyContinue)
 $OnlineN = $online.Count
