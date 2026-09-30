@@ -2,7 +2,7 @@
 # ============================================================
 #  pc_report.sh — мини-сервис: красивый HTML-отчёт о ПК (Linux)
 #
-#  Запуск:      ./pc_report.sh [-o файл.html] [--layout A|B|both]
+#  Запуск:      ./pc_report.sh [-o файл.html]
 #  Что делает:  собирает полные сведения об ОС/железе и создаёт
 #               автономный HTML-файл (тёмная тема, моноширинный
 #               шрифт, без внешних ресурсов).
@@ -10,15 +10,13 @@
 # ============================================================
 set -u
 
-LAYOUT="both"
 OUTPUT=""
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     -o|--output) OUTPUT="$2"; shift 2 ;;
-    --layout)    LAYOUT="$2"; shift 2 ;;
-    -h|--help)   sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)   sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Неизвестный параметр: $1 (см. --help)" >&2; exit 1 ;;
   esac
 done
@@ -281,7 +279,7 @@ $(echo "$IFACES" | tr ';' '\n' | awk -F'|' 'NF>=6{n++
 EOF
 }
 
-build_file() { # $1=output $2=extra-css
+build_file() { # $1=output
 cat > "$1" << HEAD
 <!DOCTYPE html>
 <html lang="ru">
@@ -289,7 +287,7 @@ cat > "$1" << HEAD
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PC Report — $(esc "$HOST") — $(date '+%d.%m.%Y %H:%M')</title>
-<style>$CSS$2</style>
+<style>$CSS</style>
 </head>
 <body>
 HEAD
@@ -297,13 +295,6 @@ gen_body >> "$1"
 echo "</body></html>" >> "$1"
 }
 
-if [ "$LAYOUT" = "A" ] || [ "$LAYOUT" = "both" ]; then
-  build_file "$OUTPUT" ""
-  say "Вариант A (карточный): $OUTPUT"
-fi
-if [ "$LAYOUT" = "B" ] || [ "$LAYOUT" = "both" ]; then
-  OUT_B="${OUTPUT%.html}_variantB.html"
-  build_file "$OUT_B" '.card{border-radius:0}.g2{grid-template-columns:1fr}.sec-title{border-left:4px solid var(--blue);padding-left:12px}.card:hover{transform:none}'
-  say "Вариант B (табличный): $OUT_B"
-fi
+build_file "$OUTPUT"
+say "Отчёт создан: $OUTPUT"
 say "Готово. Открыть в браузере: file://$(realpath "$OUTPUT" 2>/dev/null || echo "$OUTPUT")"
