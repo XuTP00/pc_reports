@@ -472,6 +472,14 @@ ssh_pass_run() { # $1..n = команда; пароль — из PCR_PW (или 
   SSH_ERR_FILE="$(mktemp /tmp/.pcr_err.XXXXXX)"
   chmod 700 "$ap"
   printf '#!/bin/sh\ncase $1 in\n *[Pp]assword*) printf "%%s\\n" "$PCR_PW" ;;\n *) printf "yes\\n" ;;\nesac\n' > "$ap"
+  # Резервный канал пароля: ssh читает password-аутентификацию со stdin.
+  # Если в stdin идут данные (pipe/файл) — сначала подаём пароль и перевод
+  # строк, затем оригинальный поток целиком.
+  PWSTDIN=""
+  if [ ! -t 0 ]; then
+    PWSTDIN="$(mktemp /tmp/.pcr_pw.XXXXXX)"
+    { printf '%s\n' "$pwv"; cat; } > "$PWSTDIN"
+  fi
   if [ -t 0 ]; then
     PCR_PW="$pwv" SSH_ASKPASS="$ap" SSH_ASKPASS_REQUIRE=force \
       setsid -w ssh "${SSH_OPTS[@]}" -o UserKnownHostsFile=/dev/null -p "$SSH_PORT" "$RUN_USER" "$@" 2>"$SSH_ERR_FILE"
@@ -481,10 +489,11 @@ ssh_pass_run() { # $1..n = команда; пароль — из PCR_PW (или 
     # а диалог авторизации отводим в /dev/null
     PCR_PW="$pwv" SSH_ASKPASS="$ap" SSH_ASKPASS_REQUIRE=force \
       setsid -w ssh "${SSH_OPTS[@]}" -o UserKnownHostsFile=/dev/null \
-          -o NumberOfPasswordPrompts=1 -p "$SSH_PORT" "$RUN_USER" "$@" <&0 2>"$SSH_ERR_FILE"
+          -o NumberOfPasswordPrompts=1 -p "$SSH_PORT" "$RUN_USER" "$@" <"$PWSTDIN" 2>"$SSH_ERR_FILE"
     rc=$?
   fi
   rm -f "$ap"
+  [ -n "$PWSTDIN" ] && rm -f "$PWSTDIN"
   return $rc
 }
 
