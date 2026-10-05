@@ -446,23 +446,42 @@ RUN_USER=""
 CUR_PASS=""
 OUTDIR="$(pwd)"
 
+# Быстрая TCP-проверка доступности порта (не зависит от ssh).
+test_port_open() { # $1=host $2=port -> 0 если порт открыт
+  timeout 6 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null
+}
+
+# Расшифровка текста ошибки ssh в краткое сообщение о проблеме.
+ssh_error_text() { # $1=stderr $2=auth_failed(0/1)
+  local r="${1,,}" h="${RUN_USER##*@}" p="$SSH_PORT"
+  case "$r" in
+    *connection\ refused*) echo "нет доступа к конечному хосту $h: порт $p закрыт (SSH-сервер не запущен)" ;;
+    *timed\ out*|*timeout*) echo "нет доступа к $h: таймаут порта $p (ПК выключен или блокирует брандмауэр)" ;;
+    *no\ route\ to\ host*|*host\ is\ down*) echo "нет маршрута до хоста $h (ПК выключен или недоступен в сети)" ;;
+    *could\ not\ resolve*|*not\ known*) echo "не удалось разрешить имя хоста из '$h' (проверьте ip/hostname)" ;;
+    *network\ is\ unreachable*) echo "сеть недоступна с этого ПК (хост $h)" ;;
+    *) if [ "${2:-0}" = "1" ]; then echo "неправильный логин или пароль от $RUN_USER"; else echo "ошибка подключения к $RUN_USER"; fi ;;
+  esac
+}
+
 # Пароль живёт только в памяти процесса; временный askpass-файл
 # существует лишь на время одной команды ssh и удаляется сразу.
 ssh_pass_run() { # $1..n = команда; пароль — из PCR_PW (или CUR_PASS)
   local ap rc pwv="${PCR_PW:-$CUR_PASS}"
   ap=$(mktemp /tmp/.pcr_ap.XXXXXX) || die "не удалось создать временный файл"
+  SSH_ERR_FILE="$(mktemp /tmp/.pcr_err.XXXXXX)"
   chmod 700 "$ap"
   printf '#!/bin/sh\ncase $1 in\n *[Pp]assword*) printf "%%s\\n" "$PCR_PW" ;;\n *) printf "yes\\n" ;;\nesac\n' > "$ap"
   if [ -t 0 ]; then
     PCR_PW="$pwv" SSH_ASKPASS="$ap" SSH_ASKPASS_REQUIRE=force \
-      setsid -w ssh "${SSH_OPTS[@]}" -o UserKnownHostsFile=/dev/null -p "$SSH_PORT" "$RUN_USER" "$@" 2>/dev/null
+      setsid -w ssh "${SSH_OPTS[@]}" -o UserKnownHostsFile=/dev/null -p "$SSH_PORT" "$RUN_USER" "$@" 2>"$SSH_ERR_FILE"
     rc=$?
   else
     # stdin занят (pipe/файл с данными сборщика) — просим ssh читать его,
     # а диалог авторизации отводим в /dev/null
     PCR_PW="$pwv" SSH_ASKPASS="$ap" SSH_ASKPASS_REQUIRE=force \
       setsid -w ssh "${SSH_OPTS[@]}" -o UserKnownHostsFile=/dev/null \
-          -o NumberOfPasswordPrompts=1 -p "$SSH_PORT" "$RUN_USER" "$@" <&0 2>/dev/null
+          -o NumberOfPasswordPrompts=1 -p "$SSH_PORT" "$RUN_USER" "$@" <&0 2>"$SSH_ERR_FILE"
     rc=$?
   fi
   rm -f "$ap"
@@ -470,7 +489,8 @@ ssh_pass_run() { # $1..n = команда; пароль — из PCR_PW (или 
 }
 
 ssh_key_run() { # проба без пароля (ключи из стандартных мест ~/.ssh/id_*)
-  ssh -o BatchMode=yes "${SSH_OPTS[@]}" -p "$SSH_PORT" "$RUN_USER" "$@" 2>/dev/null
+  SSH_ERR_FILE="$(mktemp /tmp/.pcr_err.XXXXXX)"
+  ssh -o BatchMode=yes "${SSH_OPTS[@]}" -p "$SSH_PORT" "$RUN_USER" "$@" 2>"$SSH_ERR_FILE"
 }
 
 # выполнение удалённой команды с учётом способа авторизации
@@ -481,7 +501,14 @@ run_ssh() { # $@ = команда (stdin/stdout как у вызывающего
 # авторизация: сначала ключ, затем пароль (из списка/PC_PASS/интерактивно)
 authorize() { # $1=пароль или пусто
   AUTH_MODE=""
-  if ssh_key_run true </dev/null >/dev/null 2>&1; then AUTH_MODE="key"; return 0; fi
+  # Сетевая диагностика до попыток входа
+  local host="${RUN_USER##*@}"
+  if ! test_port_open "$host" "$SSH_PORT"; then
+    say "ПРОПУСК: нет доступа к конечному хосту $host (порт $SSH_PORT закрыт или не отвечает — ПК выключен, SSH-сервер не запущен или брандмауэр)"
+    return 1
+  fi
+  if ssh_key_run true </dev/null >/dev/null 2>&1; then AUTH_MODE="key"; rm -f "$SSH_ERR_FILE"; return 0; fi
+  local keyerr=""; [ -f "$SSH_ERR_FILE" ] && keyerr="$(cat "$SSH_ERR_FILE")"; rm -f "$SSH_ERR_FILE"
   local p="${1:-${PC_PASS:-}}"
   if [ -z "$p" ] && [ -n "$CUR_PASS" ]; then p="$CUR_PASS"; fi
   if [ -z "$p" ]; then
@@ -491,13 +518,14 @@ authorize() { # $1=пароль или пусто
   fi
   [ -n "$p" ] || { say "ПРОПУСК: нет пароля для $RUN_USER"; return 1; }
   export PCR_PW="$p"
-  if ssh_pass_run true </dev/null >/dev/null 2>&1; then AUTH_MODE="pass"; return 0; fi
-  say "ПРОПУСК: вход на $RUN_USER не выполнен"
+  if ssh_pass_run true </dev/null >/dev/null 2>&1; then AUTH_MODE="pass"; rm -f "$SSH_ERR_FILE"; unset PCR_PW; return 0; fi
+  local passerr=""; [ -f "$SSH_ERR_FILE" ] && passerr="$(cat "$SSH_ERR_FILE")"; rm -f "$SSH_ERR_FILE"
+  say "ПРОПУСК: $(ssh_error_text "${passerr:-$keyerr}" 1)"
   unset PCR_PW; return 1
 }
 
-run_remote_host() { # $1=user@host  $2=порт  $3=пароль(может быть пуст)
-  RUN_USER="$1"; SSH_PORT="$2"; CUR_PASS="$3"
+run_remote_host() { # $1=user@host[:порт]  $2=порт  $3=пароль(может быть пуст)
+  RUN_USER="${1%%:*}"; SSH_PORT="$2"; CUR_PASS="$3"
   command -v ssh >/dev/null || die "не найден клиент ssh — удалённый режим недоступен"
   say "Подключение к $RUN_USER (порт $SSH_PORT)..."
   authorize "$3" || return 1
@@ -545,8 +573,8 @@ parse_target() { # разбирает user@host[:порт] → глобальн�
   P_USER="$user"; P_HOST="$host"; P_PORT="${port:-22}"
 }
 
-build_spec() { # $1=user $2=host $3=port → user@host[:port если не 22]
-  if [ "${3:-22}" = "22" ]; then printf '%s@%s' "$1" "$2"; else printf '%s@%s:%s' "$1" "$2" "$3"; fi
+build_spec() { # $1=user $2=host → user@host (порт передаётся отдельно через -p)
+  printf '%s@%s' "$1" "$2"
 }
 
 # ############################################################

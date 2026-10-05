@@ -86,13 +86,44 @@ function New-AskPass {
 
 }
 
+# Диагностика сетевой доступности хоста (до попытки авторизации).
+function Test-PortOpen([string]$H,[int]$P,[int]$T=6000) {
+  try {
+    $c = New-Object Net.Sockets.TcpClient
+    $ar = $c.BeginConnect($H,$P,$null,$null)
+    if ($ar.AsyncWaitHandle.WaitOne($T) -and $c.Connected) { $c.EndConnect($ar); $c.Close(); return $true }
+    $c.Close(); return $false
+  } catch { return $false }
+}
+
+# Расшифровка ошибки ssh в краткое человеческое сообщение.
+function Get-SshErrorText([string]$Raw,[bool]$AuthFailed) {
+  $r = $Raw.ToLower()
+  if ($r -match 'connection refused')   { return "нет доступа к конечному хосту $($script:RemoteTarget): порт $($script:RemotePort) закрыт (SSH-сервер не запущен)" }
+  if ($r -match 'timed out|timeout')    { return "нет доступа к $($script:RemoteTarget): таймаут порта $($script:RemotePort) (ПК выключен или блокирует брандмауэр)" }
+  if ($r -match 'no route to host|host is down') { return "нет маршрута до хоста $($script:RemoteTarget) (ПК выключен или недоступен в сети)" }
+  if ($r -match 'could not resolve|not known')   { return "не удалось разрешить имя хоста из '$($script:RemoteTarget)' (проверьте ip/hostname)" }
+  if ($r -match 'network is unreachable')        { return "сеть недоступна с этого ПК (хост $($script:RemoteTarget))" }
+  if ($AuthFailed)                                { return "неправильный логин или пароль от $($script:RemoteTarget)" }
+  $m=$Raw.Trim(); if(-not $m){$m='неизвестная причина'}
+  return "ошибка подключения к $($script:RemoteTarget): $m"
+}
+
 function Invoke-SshKey([string]$Cmd) {
 
   $a = @('-o','BatchMode=yes','-o','StrictHostKeyChecking=accept-new','-o','LogLevel=ERROR',
 
          '-o','ConnectTimeout=10','-p',"$($script:RemotePort)","$($script:RemoteTarget)",$Cmd)
 
-  & ssh.exe @a 2>$null
+  $prevEAP=$ErrorActionPreference; $ErrorActionPreference='SilentlyContinue'
+
+  $out = & ssh.exe @a 2>&1
+
+  $ErrorActionPreference=$prevEAP
+
+  $script:SshErr = (($out | Where-Object { $_ -is [Management.Automation.ErrorRecord] }) | ForEach-Object { $_.ToString() }) -join ' '
+
+  $out | Where-Object { $_ -isnot [Management.Automation.ErrorRecord] }
 
 }
 
@@ -112,7 +143,15 @@ function Invoke-SshPass([string]$Cmd) {
 
            '-o','ConnectTimeout=10','-p',"$($script:RemotePort)","$($script:RemoteTarget)",$Cmd)
 
-    & ssh.exe @a 2>$null
+    $prevEAP=$ErrorActionPreference; $ErrorActionPreference='SilentlyContinue'
+
+    $out = & ssh.exe @a 2>&1
+
+    $ErrorActionPreference=$prevEAP
+
+    $script:SshErr = (($out | Where-Object { $_ -is [Management.Automation.ErrorRecord] }) | ForEach-Object { $_.ToString() }) -join ' '
+
+    $out | Where-Object { $_ -isnot [Management.Automation.ErrorRecord] }
 
   } finally {
 
@@ -138,6 +177,20 @@ function Test-RemoteAuth([string]$Password) {
 
   $script:AuthMode = ''
 
+  $script:SshErr = ''
+
+  # Сетевая диагностика до попыток входа
+
+  $rh = $script:RemoteTarget.Split('@')[1]
+
+  if (-not (Test-PortOpen $rh ([int]$script:RemotePort))) {
+
+    Say "ПРОПУСК: нет доступа к конечному хосту $rh (порт $($script:RemotePort) закрыт или не отвечает — ПК выключен, SSH-сервер не запущен или брандмауэр)"
+
+    return $false
+
+  }
+
   if (((Invoke-SshKey 'echo OK') | Out-String).Trim() -eq 'OK') { $script:AuthMode='key'; return $true }
 
   $p = $Password
@@ -158,7 +211,7 @@ function Test-RemoteAuth([string]$Password) {
 
   if (((Invoke-SshPass 'echo OK') | Out-String).Trim() -eq 'OK') { $script:AuthMode='pass'; return $true }
 
-  Say "ПРОПУСК: вход на $script:RemoteTarget не выполнен"
+  Say ("ПРОПУСК: " + (Get-SshErrorText ([string]$script:SshErr) $true))
 
   $script:RemotePass = ''
 
@@ -576,15 +629,13 @@ function Run-RemoteHost([string]$Spec, [string]$Port, [string]$Password) {
 
   if ($osline -eq 'Linux') {
 
-    Say "Удалённая ОС: Linux. Сбор сведений..."
+    Say "ОШИБКА: конечный ПК $script:RemoteTarget использует Linux-дистрибутив."
 
-    $collector = Get-LinuxCollectorSh
+    Say "Для сбора с Linux используйте скрипт pc_report.sh — он работает и с Linux, и с Windows хостами:"
 
-    $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($collector))
+    Say "  ./pc_report.sh -r $user@$($script:RemoteTarget.Split('@')[1]):$pt"
 
-    $out = Invoke-Ssh "echo $b64 | base64 -d > /tmp/pcr_col.sh && bash /tmp/pcr_col.sh; rc=`$?; rm -f /tmp/pcr_col.sh; exit `$rc"
-
-    $kv = ConvertFrom-KvTsv ((($out | Out-String) -split "`r?`n"))
+    return $null
 
   } elseif ($osline -match 'MINGW|MSYS|CYGWIN') {
 
@@ -602,11 +653,11 @@ function Run-RemoteHost([string]$Spec, [string]$Port, [string]$Password) {
 
   } else {
 
-    Say "ПРОПУСК: нераспознанная удалённая ОС '$osline'"; return $null
+    Say "ПРОПУСК: нераспознанная удалённая ОС '$osline' на $($script:RemoteTarget) (ожидались Windows-хост с OpenSSH)"; return $null
 
   }
 
-  if (-not $kv -or -not $kv.ContainsKey('HOST')) { Say "ПРОПУСК: удалённый сбор не дал данных"; return $null }
+  if (-not $kv -or -not $kv.ContainsKey('HOST')) { Say "ПРОПУСК: удалённый сбор на $($script:RemoteTarget) не дал данных (проверьте, что powershell.exe доступен для входа по SSH)"; return $null }
 
   $kv['__SPEC'] = "$user@$($script:RemoteTarget.Split('@')[1]):$pt"
 
