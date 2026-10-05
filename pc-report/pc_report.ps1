@@ -54,6 +54,10 @@ $DASH = [string][char]0x2014
 
 $ErrorActionPreference = 'Continue'
 
+# Кодировка консоли UTF-8 — иначе вывод ssh.exe и сообщения на кириллице
+# превращаются в кракозябры (особенно в exe-сборке PS2EXE).
+try { [Console]::OutputEncoding=[Text.Encoding]::UTF8; $OutputEncoding=[Text.Encoding]::UTF8 } catch {}
+
 function Say($m) { Write-Host "[pc_report] $m" -ForegroundColor Cyan }
 
 function Esc($s) { if ($null -eq $s) { '' } else { ([string]$s).Replace('&','&amp;').Replace('<','&lt;').Replace('>','&gt;').Replace('"','&quot;') } }
@@ -76,9 +80,12 @@ $script:AuthMode     = ""
 
 function New-AskPass {
 
+  # SSH_ASKPASS-ответчик: печатает пароль из PCR_PW; на вопросы о host key /
+  # fingerprint отвечает 'yes'. .cmd — потому что OpenSSH для Windows запускает
+  # askpass через cmd-оболочку.
   $f = Join-Path $env:TEMP ("pcr_ap_" + [guid]::NewGuid().ToString('N').Substring(0,8) + ".cmd")
 
-  $bat = '@echo off' + "`r`n" + 'if "%~1"=="" (' + "`r`n" + '  echo %PCR_PW%' + "`r`n" + ') else (' + "`r`n" + '  echo yes' + "`r`n" + ')' + "`r`n"
+  $bat = '@echo off' + "`r`n" + 'echo %PCR_PW%' + "`r`n"
 
   Set-Content -Path $f -Value $bat -Encoding ASCII
 
@@ -104,6 +111,7 @@ function Get-SshErrorText([string]$Raw,[bool]$AuthFailed) {
   if ($r -match 'no route to host|host is down') { return "нет маршрута до хоста $($script:RemoteTarget) (ПК выключен или недоступен в сети)" }
   if ($r -match 'could not resolve|not known')   { return "не удалось разрешить имя хоста из '$($script:RemoteTarget)' (проверьте ip/hostname)" }
   if ($r -match 'network is unreachable')        { return "сеть недоступна с этого ПК (хост $($script:RemoteTarget))" }
+  if ($r -match 'host key verification failed|identification has changed') { return "ключ хоста $($script:RemoteTarget) изменился или не подтверждён (проверьте, что на целевом ПК OpenSSH-сервер переустановлен)" }
   if ($AuthFailed)                                { return "неправильный логин или пароль от $($script:RemoteTarget)" }
   $m=$Raw.Trim(); if(-not $m){$m='неизвестная причина'}
   return "ошибка подключения к $($script:RemoteTarget): $m"
@@ -137,9 +145,14 @@ function Invoke-SshPass([string]$Cmd) {
 
   $env:PCR_PW = $script:RemotePass
 
+  # Временный known_hosts: Windows OpenSSH сервер при первом подключении меняет
+  # host key — постоянный known_hosts даёт "REMOTE HOST IDENTIFICATION HAS CHANGED"
+  # и вход ошибочно выглядит как неверный пароль.
+  $kh = Join-Path $env:TEMP ("pcr_kh_" + [guid]::NewGuid().ToString('N').Substring(0,8))
+
   try {
 
-    $a = @('-o','StrictHostKeyChecking=accept-new','-o','UserKnownHostsFile=NUL','-o','LogLevel=ERROR',
+    $a = @('-o','StrictHostKeyChecking=accept-new',"-o",'UserKnownHostsFile='+$kh,'-o','LogLevel=ERROR',
 
            '-o','ConnectTimeout=10','-p',"$($script:RemotePort)","$($script:RemoteTarget)",$Cmd)
 
@@ -163,6 +176,8 @@ function Invoke-SshPass([string]$Cmd) {
 
     Remove-Item Env:\PCR_PW -ErrorAction SilentlyContinue
 
+    Remove-Item $kh -Force -ErrorAction SilentlyContinue
+
   }
 
 }
@@ -181,7 +196,8 @@ function Test-RemoteAuth([string]$Password) {
 
   # Сетевая диагностика до попыток входа
 
-  $rh = $script:RemoteTarget.Split('@')[1]
+  $rt = "$($script:RemoteTarget)"
+  $rh = $rt.Substring($rt.LastIndexOf('@')+1)
 
   if (-not (Test-PortOpen $rh ([int]$script:RemotePort))) {
 
@@ -191,7 +207,15 @@ function Test-RemoteAuth([string]$Password) {
 
   }
 
-  if (((Invoke-SshKey 'echo OK') | Out-String).Trim() -eq 'OK') { $script:AuthMode='key'; return $true }
+  # Windows-логин с кириллицей/пробелами (например "МТСNETWORK1\Администратор")
+  # в bash-совместимых шеллах (Git Bash/Cygwin на OpenSSH-сервере) ломает разбор
+  # user@host — ключевой режим там сразу даёт синтаксическую ошибку. Пробуем его
+  # только если логин ASCII и без спецсимволов; иначе — сразу парольный режим.
+  $rt2 = "$($script:RemoteTarget)"
+  $u = $rt2.Substring(0,$rt2.LastIndexOf('@'))
+  if ($u -match '^[\x21-\x7E]+$' -and $u -notmatch '[!"#$%&()*+,:;<=>?@\[\]^`{|}~ ]') {
+    if (((Invoke-SshKey 'echo OK') | Out-String).Trim() -eq 'OK') { $script:AuthMode='key'; return $true }
+  }
 
   $p = $Password
 
@@ -207,14 +231,20 @@ function Test-RemoteAuth([string]$Password) {
 
   if (-not $p) { Say "ПРОПУСК: нет пароля для $script:RemoteTarget"; return $false }
 
-  $script:RemotePass = $p
-
-  if (((Invoke-SshPass 'echo OK') | Out-String).Trim() -eq 'OK') { $script:AuthMode='pass'; return $true }
-
+  # Интерактивно даём 3 попытки ввода пароля; для режимов с PC_PASS/файлом — 1.
+  $tries = if ($Password -or $env:PC_PASS) { 1 } else { 3 }
+  for ($t=1; $t -le $tries; $t++) {
+    $script:RemotePass = $p
+    if (((Invoke-SshPass 'echo OK') | Out-String).Trim() -eq 'OK') { $script:AuthMode='pass'; return $true }
+    if ($t -lt $tries) {
+      Write-Host '[pc_report] неверный пароль, осталось попыток: $($tries-$t)' -ForegroundColor Yellow
+      $secure = Read-Host "Пароль пользователя $($script:RemoteTarget) (повторно)" -AsSecureString
+      $p = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+      if (-not $p) { break }
+    }
+  }
   Say ("ПРОПУСК: " + (Get-SshErrorText ([string]$script:SshErr) $true))
-
   $script:RemotePass = ''
-
   return $false
 
 }
@@ -605,7 +635,7 @@ function Run-RemoteHost([string]$Spec, [string]$Port, [string]$Password) {
 
   $user=''; $host_=$Spec
 
-  if ($Spec.Contains('@')) { $user=$Spec.Split('@')[0]; $host_=$Spec.Split('@')[1] }
+  if ($Spec.Contains('@')) { $user=$Spec.Substring(0,$Spec.LastIndexOf('@')); $host_=$Spec.Substring($Spec.LastIndexOf('@')+1) }
 
   $pt=22
 
@@ -623,21 +653,26 @@ function Run-RemoteHost([string]$Spec, [string]$Port, [string]$Password) {
 
   if (-not (Test-RemoteAuth $Password)) { return $null }
 
-  $osline = ((Invoke-Ssh 'uname -s') | Out-String).Trim()
-
+  # Определение удалённой ОС. На OpenSSH-сервере Windows команда 'uname -s'
+  # не существует в cmd.exe, поэтому выводимый текст может быть на локальной
+  # кодировке (кириллица) — сравниваем только ASCII-маркеры.
+  $raw = (((Invoke-Ssh 'uname -s 2>/dev/null || ver') | Out-String) -replace '[^A-Za-z0-9.\- ]','').Trim()
+  $low = $raw.ToLower()
+  $isLinux = ($low -match '^linux') -or ($low.Contains(' linux'))
+  $isWin   = $low.StartsWith('microsoft windows') -or ($low -match 'mingw|msys|cygwin') -or ($raw -match '\d+\.\d{3,}\.\d+')
   $kv = $null
 
-  if ($osline -eq 'Linux') {
+  if ($isLinux) {
 
     Say "ОШИБКА: конечный ПК $script:RemoteTarget использует Linux-дистрибутив."
 
     Say "Для сбора с Linux используйте скрипт pc_report.sh — он работает и с Linux, и с Windows хостами:"
 
-    Say "  ./pc_report.sh -r $user@$($script:RemoteTarget.Split('@')[1]):$pt"
+    Say "  ./pc_report.sh -r \"$user\"@$($script:RemoteTarget.Substring($script:RemoteTarget.LastIndexOf('@')+1)):$pt"
 
     return $null
 
-  } elseif ($osline -match 'MINGW|MSYS|CYGWIN') {
+  } elseif ($isWin) {
 
     Say "Удалённая ОС: Windows (OpenSSH). Сбор через PowerShell..."
 
@@ -645,21 +680,43 @@ function Run-RemoteHost([string]$Spec, [string]$Port, [string]$Password) {
 
     $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($ps))
 
-    $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command `"`$f=Join-Path `$env:TEMP 'pcr_win.ps1'; [IO.File]::WriteAllBytes(`$f,[Convert]::FromBase64String('$b64')); & `$f; Remove-Item `$f -Force`""
+    # Распаковка сборщика на хосте через -EncodedCommand (UTF-16LE base64):
+    # без вложенных кавычек — одинаково надёжно для cmd.exe и PowerShell шелла.
+    $inner = "[IO.File]::WriteAllBytes((Join-Path `$env:TEMP 'pcr_win.ps1'),[Convert]::FromBase64String('" + $b64 + "'))"
+    $enc   = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
+    $null  = Invoke-Ssh "powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -EncodedCommand $enc"
+    $cmd2 = "powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File %TEMP%\\pcr_win.ps1"
 
-    $out = Invoke-Ssh $cmd
+    $out = Invoke-Ssh $cmd2
 
+    # Если PowerShell-коллектор не дал KV-строк — вероятно, удалённый шелл это
+    # cmd.exe и powershell.exe не запустился напрямую. Пробуем резервный путь:
+    # явный запуск через cmd /c (часто помогает при нестандартном default shell).
     $kv = ConvertFrom-KvTsv ((($out | Out-String) -split "`r?`n"))
+
+    if (-not $kv -or -not $kv.ContainsKey('HOST')) {
+
+      Say "Прямой запуск collect.ps1 не дал данных — пробую через cmd /c..."
+
+      $out2 = Invoke-Ssh "cmd /c powershell.exe -NoProfile -ExecutionPolicy Bypass -File %TEMP%\pcr_win.ps1"
+
+      $kv2 = ConvertFrom-KvTsv ((($out2 | Out-String) -split "`r?`n"))
+
+      if ($kv2 -and $kv2.ContainsKey('HOST')) { $kv = $kv2 }
+
+    }
 
   } else {
 
-    Say "ПРОПУСК: нераспознанная удалённая ОС '$osline' на $($script:RemoteTarget) (ожидались Windows-хост с OpenSSH)"; return $null
+    Say "ПРОПУСК: нераспознанная удалённая ОС '$raw' на $script:RemoteTarget (ожидался Windows-хост с OpenSSH)"; return $null
 
   }
 
+  Invoke-Ssh "del %TEMP%\pcr_win.ps1 2>nul" | Out-Null
+
   if (-not $kv -or -not $kv.ContainsKey('HOST')) { Say "ПРОПУСК: удалённый сбор на $($script:RemoteTarget) не дал данных (проверьте, что powershell.exe доступен для входа по SSH)"; return $null }
 
-  $kv['__SPEC'] = "$user@$($script:RemoteTarget.Split('@')[1]):$pt"
+  $kv['__SPEC'] = "$user@$($script:RemoteTarget.Substring($script:RemoteTarget.LastIndexOf('@')+1)):$pt"
 
   return $kv
 
