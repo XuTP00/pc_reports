@@ -78,19 +78,35 @@ $script:RemotePass   = ""
 
 $script:AuthMode     = ""
 
-function New-AskPass {
+$script:PwFile = ""
 
-  # SSH_ASKPASS-ответчик: печатает пароль из PCR_PW; на вопросы о host key /
-  # fingerprint отвечает 'yes'. .cmd — потому что OpenSSH для Windows запускает
-  # askpass через cmd-оболочку.
-  $f = Join-Path $env:TEMP ("pcr_ap_" + [guid]::NewGuid().ToString('N').Substring(0,8) + ".cmd")
+function Get-PwFile {
+  # Файл с паролем во временной папке (нужен для stdin-передачи ssh.exe).
+  if (-not $script:PwFile) {
+    $script:PwFile = Join-Path $env:TEMP ("pcr_pw_" + [guid]::NewGuid().ToString('N').Substring(0,8))
+  }
+  [IO.File]::WriteAllText($script:PwFile, $script:RemotePass, [Text.Encoding]::ASCII)
+  return $script:PwFile
+}
 
-  $bat = '@echo off' + "`r`n" + 'echo %PCR_PW%' + "`r`n"
+function Remove-PwFile {
+  if ($script:PwFile -and (Test-Path $script:PwFile)) { Remove-Item $script:PwFile -Force -ErrorAction SilentlyContinue }
+  $script:PwFile = ""
+}
 
-  Set-Content -Path $f -Value $bat -Encoding ASCII
-
-  return $f
-
+# Надёжная передача пароля: НЕ полагаемся только на SSH_ASKPASS (на некоторых
+# сборках Windows OpenSSH он не вызывается вовсе -> ssh уходит в скрытый
+# интерактивный ввод, получает пустую строку и сервер отвечает "Access denied",
+# хотя пароль верный). Пароль передаётся ssh.exe напрямую на stdin из временного
+# файла; SSH_ASKPASS остаётся резервным каналом. Нигде не сохраняется: файл
+# удаляется сразу после подключения.
+function Read-PasswordViaDialog([string]$Target,[bool]$Repeat) {
+  $prompt = "Введите пароль SSH для пользователя $Target"
+  if ($Repeat) { $prompt = "$prompt (повторно)" }
+  try {
+    $cred = [System.Management.Automation.Credential]::Create($Target, $prompt)
+    return $cred.GetNetworkCredential().Password
+  } catch { return "" }
 }
 
 # Диагностика сетевой доступности хоста (до попытки авторизации).
@@ -137,7 +153,19 @@ function Invoke-SshKey([string]$Cmd) {
 
 function Invoke-SshPass([string]$Cmd) {
 
-  $ap = New-AskPass
+  # Передача пароля ДВУМЯ независимыми каналами: ssh.exe на Windows НЕ читает
+
+  # пароль со stdin (на Unix-ssh читает — поэтому pc_report.sh работает), а
+
+  # SSH_ASKPASS вызывается не во всех сборках. Поэтому дополнительно к
+
+  # ответчику используется sshpass, если он доступен (Git Bash / WSL).
+
+  $pf = Get-PwFile
+
+  $ap = Join-Path $env:TEMP ("pcr_ap_" + [guid]::NewGuid().ToString('N').Substring(0,8) + ".cmd")
+
+  Set-Content -Path $ap -Value ('@echo off' + "`r`n" + 'if not defined PCR_PW exit 0' + "`r`n" + 'echo %PCR_PW%' + "`r`n") -Encoding ASCII
 
   $env:SSH_ASKPASS = $ap
 
@@ -146,19 +174,32 @@ function Invoke-SshPass([string]$Cmd) {
   $env:PCR_PW = $script:RemotePass
 
   # Временный known_hosts: Windows OpenSSH сервер при первом подключении меняет
+
   # host key — постоянный known_hosts даёт "REMOTE HOST IDENTIFICATION HAS CHANGED"
+
   # и вход ошибочно выглядит как неверный пароль.
+
   $kh = Join-Path $env:TEMP ("pcr_kh_" + [guid]::NewGuid().ToString('N').Substring(0,8))
 
   try {
 
     $a = @('-o','StrictHostKeyChecking=accept-new',"-o",'UserKnownHostsFile='+$kh,'-o','LogLevel=ERROR',
 
-           '-o','ConnectTimeout=10','-p',"$($script:RemotePort)","$($script:RemoteTarget)",$Cmd)
+           '-o','ConnectTimeout=10','-o','NumberOfPasswordPrompts=1','-o','PubkeyAuthentication=no','-o','PreferredAuthentications=password,keyboard-interactive','-p',"$($script:RemotePort)","$($script:RemoteTarget)",$Cmd)
 
     $prevEAP=$ErrorActionPreference; $ErrorActionPreference='SilentlyContinue'
 
-    $out = & ssh.exe @a 2>&1
+    $sp = Get-Command sshpass.exe -ErrorAction SilentlyContinue
+
+    if ($sp) {
+
+      $out = & $sp.Source '-f' $pf ssh.exe @a 2>&1
+
+    } else {
+
+      $out = & ssh.exe @a 2>&1 < $pf
+
+    }
 
     $ErrorActionPreference=$prevEAP
 
@@ -178,9 +219,13 @@ function Invoke-SshPass([string]$Cmd) {
 
     Remove-Item $kh -Force -ErrorAction SilentlyContinue
 
+    Remove-PwFile
+
   }
 
 }
+
+
 
 function Invoke-Ssh([string]$Cmd) {
 
@@ -194,10 +239,13 @@ function Test-RemoteAuth([string]$Password) {
 
   $script:SshErr = ''
 
+
   # Сетевая диагностика до попыток входа
 
   $rt = "$($script:RemoteTarget)"
+
   $rh = $rt.Substring($rt.LastIndexOf('@')+1)
+
 
   if (-not (Test-PortOpen $rh ([int]$script:RemotePort))) {
 
@@ -207,47 +255,77 @@ function Test-RemoteAuth([string]$Password) {
 
   }
 
-  # Windows-логин с кириллицей/пробелами (например "МТСNETWORK1\Администратор")
-  # в bash-совместимых шеллах (Git Bash/Cygwin на OpenSSH-сервере) ломает разбор
-  # user@host — ключевой режим там сразу даёт синтаксическую ошибку. Пробуем его
-  # только если логин ASCII и без спецсимволов; иначе — сразу парольный режим.
-  $rt2 = "$($script:RemoteTarget)"
-  $u = $rt2.Substring(0,$rt2.LastIndexOf('@'))
+
+  # Ключевая аутентификация пробуется только для ASCII-логинов без спецсимволов
+
+  # (доменные кириллические логины ломают разбор user@host в некоторых шеллах).
+
+  $u = $rt.Substring(0,$rt.LastIndexOf('@'))
+
   if ($u -match '^[\x21-\x7E]+$' -and $u -notmatch '[!"#$%&()*+,:;<=>?@\[\]^`{|}~ ]') {
+
     if (((Invoke-SshKey 'echo OK') | Out-String).Trim() -eq 'OK') { $script:AuthMode='key'; return $true }
+
   }
+
 
   $p = $Password
 
   if (-not $p) { $p = $env:PC_PASS }
 
-  if (-not $p) {
+  if (-not $p) { $p = Read-PasswordViaDialog $rt $false }
 
-    $secure = Read-Host "Пароль пользователя $($script:RemoteTarget)" -AsSecureString
+  if (-not $p) { $p = Read-Host "Пароль пользователя $rt" }
 
-    $p = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
 
-  }
+  if (-not $p) { Say "ПРОПУСК: нет пароля для $rt"; return $false }
 
-  if (-not $p) { Say "ПРОПУСК: нет пароля для $script:RemoteTarget"; return $false }
 
-  # Интерактивно даём 3 попытки ввода пароля; для режимов с PC_PASS/файлом — 1.
+  # Интерактивно даём 3 попытки ввода пароля; для PC_PASS/файла-списка — 1.
+
   $tries = if ($Password -or $env:PC_PASS) { 1 } else { 3 }
+
   for ($t=1; $t -le $tries; $t++) {
+
     $script:RemotePass = $p
-    if (((Invoke-SshPass 'echo OK') | Out-String).Trim() -eq 'OK') { $script:AuthMode='pass'; return $true }
+
+    if (((Invoke-SshPass 'echo OK') | Out-String).Trim() -eq 'OK') { $script:AuthMode='pass'; $script:RemotePass=''; return $true }
+
     if ($t -lt $tries) {
-      Write-Host '[pc_report] неверный пароль, осталось попыток: $($tries-$t)' -ForegroundColor Yellow
-      $secure = Read-Host "Пароль пользователя $($script:RemoteTarget) (повторно)" -AsSecureString
-      $p = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+
+      $left = $tries - $t
+
+      Write-Host "[pc_report] неверный пароль, осталось попыток: $left" -ForegroundColor Yellow
+
+      $p = Read-PasswordViaDialog $rt $true
+
+      if (-not $p) { $p = Read-Host "Пароль пользователя $rt (повторно)" }
+
       if (-not $p) { break }
+
     }
+
   }
-  Say ("ПРОПУСК: " + (Get-SshErrorText ([string]$script:SshErr) $true))
+
+  $errTxt = Get-SshErrorText ([string]$script:SshErr) $true
+
+  Say "ПРОПУСК: $errTxt"
+
+  if ($errTxt -match 'логин или пароль') {
+
+    Say "Подсказка: если ручной "ssh user@host" с этим паролем работает, значит ваш ssh.exe игнорирует автоматический ввод пароля."
+
+    Say "Решение: установите sshpass (например: scoop install sshpass или скачайте из Git for Windows в C:\Program Files\Git\usr\bin) и повторите запуск."
+
+  }
+
   $script:RemotePass = ''
+
   return $false
 
 }
+
+
 
 function ConvertFrom-KvTsv([string[]]$Lines) {
 
