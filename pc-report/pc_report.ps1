@@ -20,17 +20,35 @@
 
 #  Требования:  Windows 10/11, PowerShell 5.1+ (без внешних модулей).
 
-#  Удалённый режим: навык копирует этот файл на целевой Windows-ПК
+#  Удалённый режим (-r): подключение по SSH к удалённому ПК
 
-#               (SCP/SMB/WinRM) и запускает его ТАМ локально; затем
+#               (Linux или Windows), сбор данных на нём, а итоговый HTML-
 
-#               готовый HTML забирается обратно. Сам скрипт — только
+#               отчёт сохраняется ЗДЕСЬ — в папке запуска этого скрипта.
 
-#               локальный сборщик.
+#  Запуск:
+
+#               .\pc_report.ps1                       (локально)
+
+#               .\pc_report.ps1 -r user@ip[:порт]     (один хост)
+
+#               .\pc_report.ps1 -r список.txt         (user ; ip ; password ; port)
+
+#  Для -r нужен клиент OpenSSH (ssh.exe, входит в Windows 10+). Пароль
+
+#               нигде не сохраняется: временный askpass удаляется сразу.
 
 # ============================================================
 
-param([string]$Output = "")
+param(
+
+  [string]$Output = "",
+
+  [string]$Remote = "",
+
+  [Alias("r")][string]$R = ""
+
+)
 
 
 
@@ -44,7 +62,839 @@ function Esc($s) { if ($null -eq $s) { '' } else { ([string]$s).Replace('&','&am
 
 function GB($bytes) { if ($bytes -gt 0) { ('{0:N1} ГБ' -f ($bytes/1GB)) } else { $DASH } }
 
+# ============================================================
 
+#  Удалённый режим (-r): SSH-сбор с Linux/Windows хостов
+
+# ============================================================
+
+$script:RemoteTarget = ""
+
+$script:RemotePort   = 22
+
+$script:RemotePass   = ""
+
+$script:AuthMode     = ""
+
+function New-AskPass {
+
+  $f = Join-Path $env:TEMP ("pcr_ap_" + [guid]::NewGuid().ToString('N').Substring(0,8) + ".cmd")
+
+  $bat = '@echo off' + "`r`n" + 'if "%~1"=="" (' + "`r`n" + '  echo %PCR_PW%' + "`r`n" + ') else (' + "`r`n" + '  echo yes' + "`r`n" + ')' + "`r`n"
+
+  Set-Content -Path $f -Value $bat -Encoding ASCII
+
+  return $f
+
+}
+
+function Invoke-SshKey([string]$Cmd) {
+
+  $a = @('-o','BatchMode=yes','-o','StrictHostKeyChecking=accept-new','-o','LogLevel=ERROR',
+
+         '-o','ConnectTimeout=10','-p',"$($script:RemotePort)","$($script:RemoteTarget)",$Cmd)
+
+  & ssh.exe @a 2>$null
+
+}
+
+function Invoke-SshPass([string]$Cmd) {
+
+  $ap = New-AskPass
+
+  $env:SSH_ASKPASS = $ap
+
+  $env:SSH_ASKPASS_REQUIRE = 'force'
+
+  $env:PCR_PW = $script:RemotePass
+
+  try {
+
+    $a = @('-o','StrictHostKeyChecking=accept-new','-o','UserKnownHostsFile=NUL','-o','LogLevel=ERROR',
+
+           '-o','ConnectTimeout=10','-p',"$($script:RemotePort)","$($script:RemoteTarget)",$Cmd)
+
+    & ssh.exe @a 2>$null
+
+  } finally {
+
+    Remove-Item $ap -Force -ErrorAction SilentlyContinue
+
+    Remove-Item Env:\SSH_ASKPASS -ErrorAction SilentlyContinue
+
+    Remove-Item Env:\SSH_ASKPASS_REQUIRE -ErrorAction SilentlyContinue
+
+    Remove-Item Env:\PCR_PW -ErrorAction SilentlyContinue
+
+  }
+
+}
+
+function Invoke-Ssh([string]$Cmd) {
+
+  if ($script:AuthMode -eq 'key') { Invoke-SshKey $Cmd } else { Invoke-SshPass $Cmd }
+
+}
+
+function Test-RemoteAuth([string]$Password) {
+
+  $script:AuthMode = ''
+
+  if (((Invoke-SshKey 'echo OK') | Out-String).Trim() -eq 'OK') { $script:AuthMode='key'; return $true }
+
+  $p = $Password
+
+  if (-not $p) { $p = $env:PC_PASS }
+
+  if (-not $p) {
+
+    $secure = Read-Host "Пароль пользователя $($script:RemoteTarget)" -AsSecureString
+
+    $p = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+
+  }
+
+  if (-not $p) { Say "ПРОПУСК: нет пароля для $script:RemoteTarget"; return $false }
+
+  $script:RemotePass = $p
+
+  if (((Invoke-SshPass 'echo OK') | Out-String).Trim() -eq 'OK') { $script:AuthMode='pass'; return $true }
+
+  Say "ПРОПУСК: вход на $script:RemoteTarget не выполнен"
+
+  $script:RemotePass = ''
+
+  return $false
+
+}
+
+function ConvertFrom-KvTsv([string[]]$Lines) {
+
+  $h = @{}
+
+  foreach ($l in $Lines) {
+
+    if ($l.Contains("`t")) { $p = $l.Split("`t", 2); if (-not $h.ContainsKey($p[0])) { $h[$p[0]] = $p[1].Trim() } }
+
+  }
+
+  return $h
+
+}
+
+function Get-LinuxCollectorSh {
+
+  return @'
+
+#!/usr/bin/env bash
+
+emit(){ printf '\t%s\t%s\n' "$1" "${2:-}"; }
+
+OS_NAME=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || echo Linux)
+
+emit HOST "$(hostname)"
+
+emit OS_NAME "$OS_NAME"
+
+emit OS_VER "$(uname -r)"
+
+emit KERNEL "$(uname -r)"
+
+emit ARCH "$(uname -m)"
+
+B=64-bit; [[ "$(uname -m)" =~ i[3-6]86 ]] && B=32-bit
+
+emit BITS "$B"
+
+emit USER_NOW "$(id -un)"
+
+emit HOME_DIR "$HOME"
+
+V=bare-metal
+
+grep -qa docker /proc/1/cgroup 2>/dev/null && V=Docker
+
+command -v systemd-detect-virt >/dev/null && { x=$(systemd-detect-virt 2>/dev/null||true); [ -n "$x" ] && [ "$x" != none ] && V="$x"; }
+
+emit ENV_TYPE "$V"
+
+emit UPTIME "$(awk '{printf "uptime %.0f h", $1/3600}' /proc/uptime)"
+
+CM=$(lscpu 2>/dev/null | awk -F: '/Model name/{gsub(/^ +/,"",$2);print $2;exit}')
+
+[[ -z "$CM" ]] && CM=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //')
+
+emit CPU_MODEL "$CM"
+
+emit CPU_VENDOR "$(lscpu 2>/dev/null | awk -F: '/Vendor ID/{gsub(/^ +/,"",$2);print $2;exit}')"
+
+NS=$(lscpu 2>/dev/null | awk -F: '/^Socket\(s\)/{gsub(/ /,"",$2);print $2}'); NC=$(lscpu 2>/dev/null | awk -F: '/^Core\(s\) per socket/{gsub(/ /,"",$2);print $2}')
+
+emit CPU_SOCKETS "${NS:-1}"
+
+emit CPU_CORES "$(awk -v c="${NC:-1}" -v s="${NS:-1}" 'BEGIN{print c*s}')"
+
+emit CPU_THREADS "$(nproc)"
+
+emit CPU_MHZ "$(awk -F: '/cpu MHz/{printf "%.0f",$2;exit}' /proc/cpuinfo)"
+
+emit CPU_L3 "$(lscpu 2>/dev/null | awk -F: '/L3 cache/{gsub(/^ +/,"",$2);print $2;exit}')"
+
+emit CPU_FLAGS "$(grep -m1 flags /proc/cpuinfo | cut -d: -f2 | tr -s ' ' | cut -d' ' -f2-12)"
+
+MV=$(cat /sys/class/dmi/id/board_vendor 2>/dev/null); MP=$(cat /sys/class/dmi/id/board_name 2>/dev/null)
+
+emit MOTHERBOARD "$MV $MP"
+
+emit MB_VERSION "$(cat /sys/class/dmi/id/board_version 2>/dev/null)"
+
+emit SYS_VENDOR "$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null)"
+
+emit BIOS_VER "$(cat /sys/class/dmi/id/bios_version 2>/dev/null)"
+
+emit BIOS_DATE "$(cat /sys/class/dmi/id/bios_date 2>/dev/null)"
+
+TK=$(awk '/MemTotal/{print $2}' /proc/meminfo); AK=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+
+emit RAM_TOTAL "$(awk -v k=$TK 'BEGIN{printf "%.0f GB", k/1048576}')"
+
+emit RAM_AVAIL "$(awk -v k=$AK 'BEGIN{printf "%.1f GB", k/1048576}')"
+
+RM=""; RC=0
+
+if command -v dmidecode >/dev/null 2>&1; then
+
+  RM=$(dmidecode -t memory 2>/dev/null | awk 'BEGIN{RS="\n\n+";OFS="|"} /Memory Device/ && !/No Module Installed/ {m="?";s="?";t="?";f="?";p="?"; n=split($0,L,"\n"); for(i=1;i<=n;i++){ if(L[i]~/^Manufacturer:/){sub(/^Manufacturer: */,"",L[i]);m=L[i]} if(L[i]~/^Size:/){sub(/^Size: */,"",L[i]);s=L[i]} if(L[i]~/^Type:/){sub(/^Type: */,"",L[i]);t=L[i]} if(L[i]~/Clock Speed:/&&f=="?"){sub(/.*: */,"",L[i]);f=L[i]} if(L[i]~/^Part Number:/){sub(/^Part Number: */,"",L[i]);p=L[i]} } if(s~/[0-9]+ [KMGT]?B/) print m,s,t,f,p }' | paste -sd';')
+
+fi
+
+[ -n "$RM" ] && RC=$(tr ';' '\n' <<<"$RM" | grep -c .)
+
+emit RAM_MODULES "$RM"
+
+emit RAM_COUNT "$RC"
+
+emit RAM_SRC "dmidecode/DMI"
+
+GN=$(lspci 2>/dev/null | grep -Ei 'VGA|3D controller|Display' | head -1 | sed -E 's/^[0-9a-f:.]+ [^:]+: //; s/ \(rev[^)]*\)//I')
+
+emit GPU_NAME "${GN:-n/a}"
+
+emit GPU_BUS "$(lspci 2>/dev/null | grep -Ei 'VGA|3D controller|Display' | head -1 | awk '{print $1}')"
+
+DV="(unknown)"; BUS=$(lspci 2>/dev/null | grep -Ei 'VGA|3D controller|Display' | head -1 | awk '{print $1}')
+
+[ -n "$BUS" ] && [ -L "/sys/bus/pci/devices/0000:$BUS/driver" ] && DV=$(basename "$(readlink -f /sys/bus/pci/devices/0000:$BUS/driver)")
+
+emit GPU_DRV "$DV"
+
+VR="-"
+
+if command -v nvidia-smi >/dev/null 2>&1; then nv=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null|head -1); [ -n "$nv" ] && VR="$nv"; fi
+
+emit GPU_VRAM "$VR"
+
+DS=""
+
+while IFS= read -r line; do
+
+  src=$(awk '{print $1}' <<<"$line"); fs=$(awk '{print $2}' <<<"$line"); sz=$(awk '{print $3}' <<<"$line")
+
+  us=$(awk '{print $4}' <<<"$line"); fr=$(awk '{print $5}' <<<"$line"); pc=$(awk '{print $6}' <<<"$line"); mt=$(awk '{print $7}' <<<"$line")
+
+  DS+="$src|$fs|$sz|$us|$fr|$pc|$mt;"
+
+done < <(df -hT -x tmpfs -x devtmpfs -x squashfs -x overlay 2>/dev/null | tail -n +2)
+
+emit DISKS "${DS%;}"
+
+RS=$(findmnt -n -o SOURCE / 2>/dev/null || df / | awk 'NR==2{print $1}')
+
+emit ROOT_DEV "$RS"
+
+emit ROOT_FS "$(df -T / 2>/dev/null | awk 'NR==2{print $2}')"
+
+emit ROOT_SIZE "$(df -h / | awk 'NR==2{print $2}')"
+
+emit ROOT_USED "$(df -h / | awk 'NR==2{print $3}')"
+
+emit ROOT_FREE "$(df -h / | awk 'NR==2{print $4}')"
+
+emit ROOT_PUSE "$(df / | awk 'NR==2{print $5}')"
+
+PD=$(lsblk -d -o NAME,SIZE,MODEL,ROTA 2>/dev/null | awk '$1!="NAME"{printf "%s (%s, %s%s); ",$1,$2,$3,(($4==1)?" HDD":" SSD/NVMe")}')
+
+emit PHYSICAL_DISKS "${PD%; }"
+
+IS=""
+
+for d in /sys/class/net/*; do
+
+  n=$(basename "$d"); [ "$n" = lo ] && continue
+
+  mac=$(cat "$d/address" 2>/dev/null); st=$(cat "$d/operstate" 2>/dev/null)
+
+  ips=$(ip -o -4 addr show dev "$n" 2>/dev/null | awk '{split($4,a,"/");printf "%s, ",a[1]}')
+
+  gw=$(ip route show default dev "$n" 2>/dev/null | awk '{print $3;exit}')
+
+  IS+="$n|${st^^}|${ips%, }|$mac|${gw:--}|DHCP?|-;"
+
+done
+
+emit IFACES "${IS%;}"
+
+emit DNS "$(awk '/^nameserver/{printf "%s, ",$2}' /etc/resolv.conf 2>/dev/null | sed 's/, $//')"
+
+emit USERS_LOGIN "$(awk -F: '$3>=1000&&$3<65534{printf "%s, ",$1}' /etc/passwd | sed 's/, $//')"
+
+emit USERS_ALL_N "$(awk -F: '$3>=1000&&$3<65534' /etc/passwd | wc -l)"
+
+emit USERS_ONLINE "$(who 2>/dev/null | awk '{print $1}' | sort -u | wc -l)"
+
+emit DATE_NOW "$(date '+%d.%m.%Y %H:%M')"
+
+'@
+
+}
+
+function Get-WinCollectorScript {
+
+  return @'
+
+$ErrorActionPreference='Continue'
+
+$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8
+
+function E($v){if($null -eq $v){''}else{([string]$v).Trim().Replace("`r"," ").Replace("`n"," ")}}
+
+function emit($k,$v){Write-Host ("`t"+$k+"`t"+(E $v))}
+
+function GB($b){if($b -gt 0){('{0:N1} GB' -f ($b/1GB))}else{'n/a'}}
+
+$os=Get-CimInstance Win32_OperatingSystem
+
+$cs=Get-CimInstance Win32_ComputerSystem
+
+emit HOST $cs.Name
+
+emit OS_NAME $os.Caption
+
+emit OS_VER ("{0} (build {1})" -f $os.Version,$os.BuildNumber)
+
+emit KERNEL $os.Version
+
+$arch=E $env:PROCESSOR_ARCHITECTURE; if(-not $arch){$arch=E $os.OSArchitecture}
+
+emit ARCH $arch
+
+emit BITS (if("$arch" -match '64'){'64-bit'}elseif("$arch" -match '86|32'){'32-bit'}else{'n/a'})
+
+emit USER_NOW ("{0}\{1}" -f $env:USERDOMAIN,$env:USERNAME)
+
+emit HOME_DIR $env:USERPROFILE
+
+emit ENV_TYPE 'physical/virtual (see manufacturer)'
+
+$up=((Get-Date)-$os.LastBootUpTime); emit UPTIME ('uptime {0} d {1} h {2} min' -f $up.Days,$up.Hours,$up.Minutes)
+
+$cpus=@(Get-CimInstance Win32_Processor); $cpu=$cpus[0]
+
+emit CPU_MODEL $cpu.Name
+
+emit CPU_VENDOR $cpu.Manufacturer
+
+emit CPU_SOCKETS $cpus.Count
+
+emit CPU_CORES (($cpus|Measure-Object -Property NumberOfCores -Sum).Sum)
+
+emit CPU_THREADS (($cpus|Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum)
+
+emit CPU_MHZ $cpu.CurrentClockSpeed
+
+$L2=($cpus|Measure-Object -Property L2CacheSize -Sum).Sum
+
+$L3=($cpus|Measure-Object -Property L3CacheSize -Sum).Sum
+
+emit CPU_L3 "$(if($L3){[math]::Round($L3/1MB,1)}elseif($L2){[math]::Round($L2/1MB,1)}else{0}) MB"
+
+emit CPU_FLAGS (E $cpu.SecondLevelAddressTranslationExtensions)
+
+$mb=Get-CimInstance Win32_BaseBoard
+
+emit MOTHERBOARD ("{0} {1}" -f $mb.Manufacturer,$mb.Product)
+
+emit MB_VERSION $mb.Version
+
+emit SYS_VENDOR $cs.Manufacturer
+
+$bios=Get-CimInstance Win32_BIOS
+
+emit BIOS_VER $bios.SMBIOSBIOSVersion
+
+emit BIOS_DATE $(try{$bios.ReleaseDate.ToString('dd.MM.yyyy')}catch{'n/a'})
+
+$mods=@(Get-CimInstance Win32_PhysicalMemory)
+
+$total=($mods|Measure-Object -Property Capacity -Sum).Sum
+
+if(-not $total){$total=$cs.TotalPhysicalMemory}
+
+emit RAM_TOTAL (GB $total)
+
+emit RAM_AVAIL (GB ($os.FreePhysicalMemory*1KB))
+
+$rs=''
+
+foreach($m in $mods){
+
+ $rs+=("{0}|{1}|{2}|{3}|{4};" -f (E $m.Manufacturer),(GB $m.Capacity),(E $m.SMBIOSMemoryType),"$($m.Speed) MHz",(E $m.PartNumber))
+
+}
+
+emit RAM_MODULES ($rs.TrimEnd(';'))
+
+emit RAM_COUNT (@($mods).Count)
+
+emit RAM_SRC 'WMI Win32_PhysicalMemory'
+
+$g=@(Get-CimInstance Win32_VideoController)
+
+if($g.Count -gt 0){
+
+ $vg=[math]::Round($g[0].AdapterRAM/1GB,2)
+
+ emit GPU_NAME $g[0].Name
+
+ emit GPU_BUS (E $g[0].PNPDeviceID)
+
+ emit GPU_DRV $g[0].DriverVersion
+
+ emit GPU_VRAM $(if($vg -gt 0){"$vg GB"}else{'shared'})
+
+}else{emit GPU_NAME 'n/a';emit GPU_BUS '';emit GPU_DRV '';emit GPU_VRAM 'n/a'}
+
+$d=@(Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3")
+
+$ds=''
+
+foreach($v in $d){
+
+ $u=if($v.Size -gt 0){[math]::Round((($v.Size-$v.FreeSpace)/$v.Size)*100)}else{0}
+
+ $ds+=("{0}|{1}|{2}|{3}|{4}|{5}%|{6} ({7});" -f $v.DeviceID,$v.FileSystem,(GB $v.Size),(GB ($v.Size-$v.FreeSpace)),(GB $v.FreeSpace),$u,$v.DeviceID,(E $v.VolumeName))
+
+}
+
+emit DISKS ($ds.TrimEnd(';'))
+
+$sysdrive=($env:SystemRoot).Substring(0,2)+'\'
+
+$root=$d | Where-Object {$_.DeviceID -eq $sysdrive} | Select-Object -First 1
+
+if($root){
+
+ emit ROOT_DEV $root.DeviceID; emit ROOT_FS $root.FileSystem
+
+ emit ROOT_SIZE (GB $root.Size); emit ROOT_USED (GB ($root.Size-$root.FreeSpace))
+
+ emit ROOT_FREE (GB $root.FreeSpace)
+
+ emit ROOT_PUSE "$([math]::Round((($root.Size-$root.FreeSpace)/$root.Size)*100))%"
+
+}else{emit ROOT_DEV 'n/a';emit ROOT_FS '';emit ROOT_SIZE '';emit ROOT_USED '';emit ROOT_FREE '';emit ROOT_PUSE '0%'}
+
+$pd=@(Get-CimInstance Win32_DiskDrive)
+
+$ps=''
+
+foreach($x in $pd){$ps+=("{0} ({1}, {2}, {3});" -f (E $x.Model),(GB $x.Size),(E $x.InterfaceType),(E $x.MediaType))}
+
+emit PHYSICAL_DISKS ($ps.TrimEnd(';'))
+
+$ni=@(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True")
+
+$is=''
+
+foreach($n in $ni){
+
+ $mode=if($n.DHCPEnabled){'DHCP'}else{'STATIC'}
+
+ $ip=if($n.IPAddress){(($n.IPAddress | Where-Object {$_ -match '^\d+\.'}) -join ',')}else{''}
+
+ $gw=if($n.DefaultIPGateway){$n.DefaultIPGateway[0]}else{''}
+
+ $dn=if($n.DNSServerSearchOrder){$n.DNSServerSearchOrder -join ','}else{''}
+
+ $is+=("{0}|UP|{1}|{2}|{3}|{4}|{5};" -f (E $n.Description),$ip,(E $n.MACAddress),$gw,$mode,$dn)
+
+}
+
+emit IFACES ($is.TrimEnd(';'))
+
+$dnall=if($ni -and $ni[0].DNSServerSearchOrder){$ni[0].DNSServerSearchOrder -join ', '}else{'n/a'}
+
+emit DNS $dnall
+
+$lu=@(Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True" | Where-Object {$_.SIDType -eq 1 -and $_.Name -notmatch '^(Guest|DefaultAccount|WDAGUtilityAccount)$'})
+
+emit USERS_LOGIN (($lu | ForEach-Object {$_.Name}) -join ', ')
+
+emit USERS_ALL_N $lu.Count
+
+emit USERS_ONLINE (@(Get-CimInstance Win32_LogonSession -ErrorAction SilentlyContinue | Where-Object {$_.LogonType -eq 2 -or $_.LogonType -eq 10}).Count)
+
+emit DATE_NOW (Get-Date -Format 'dd.MM.yyyy HH:mm')
+
+'@
+
+}
+
+function Run-RemoteHost([string]$Spec, [string]$Port, [string]$Password) {
+
+  $user=''; $host_=$Spec
+
+  if ($Spec.Contains('@')) { $user=$Spec.Split('@')[0]; $host_=$Spec.Split('@')[1] }
+
+  $pt=22
+
+  if ($Port) { $pt=[int]$Port }
+
+  elseif ($host_.Contains(':')) { $pt=[int]$host_.Split(':')[1]; $host_=$host_.Split(':')[0] }
+
+  if (-not $user) { $user = [Environment]::UserName }
+
+  $script:RemoteTarget = "$user@$host_"
+
+  $script:RemotePort = $pt
+
+  Say "Подключение к $script:RemoteTarget (порт $pt)..."
+
+  if (-not (Test-RemoteAuth $Password)) { return $null }
+
+  $osline = ((Invoke-Ssh 'uname -s') | Out-String).Trim()
+
+  $kv = $null
+
+  if ($osline -eq 'Linux') {
+
+    Say "Удалённая ОС: Linux. Сбор сведений..."
+
+    $collector = Get-LinuxCollectorSh
+
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($collector))
+
+    $out = Invoke-Ssh "echo $b64 | base64 -d > /tmp/pcr_col.sh && bash /tmp/pcr_col.sh; rc=`$?; rm -f /tmp/pcr_col.sh; exit `$rc"
+
+    $kv = ConvertFrom-KvTsv ((($out | Out-String) -split "`r?`n"))
+
+  } elseif ($osline -match 'MINGW|MSYS|CYGWIN') {
+
+    Say "Удалённая ОС: Windows (OpenSSH). Сбор через PowerShell..."
+
+    $ps = Get-WinCollectorScript
+
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($ps))
+
+    $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command `"`$f=Join-Path `$env:TEMP 'pcr_win.ps1'; [IO.File]::WriteAllBytes(`$f,[Convert]::FromBase64String('$b64')); & `$f; Remove-Item `$f -Force`""
+
+    $out = Invoke-Ssh $cmd
+
+    $kv = ConvertFrom-KvTsv ((($out | Out-String) -split "`r?`n"))
+
+  } else {
+
+    Say "ПРОПУСК: нераспознанная удалённая ОС '$osline'"; return $null
+
+  }
+
+  if (-not $kv -or -not $kv.ContainsKey('HOST')) { Say "ПРОПУСК: удалённый сбор не дал данных"; return $null }
+
+  $kv['__SPEC'] = "$user@$($script:RemoteTarget.Split('@')[1]):$pt"
+
+  return $kv
+
+}
+
+
+
+# ---------- выбор режима: локальный или удалённый (-r) ----------
+
+$RemoteSpec = if ($Remote) { $Remote } elseif ($R) { $R } else { "" }
+
+if ($RemoteSpec) {
+
+  Say "Удалённый режим (-r). Отчёты сохраняются в папке запуска: $(Get-Location)"
+
+  $KvsList = @()
+
+  if (Test-Path $RemoteSpec -PathType Leaf) {
+
+    # ----- файл-список: user ; ip/hostname ; password ; port -----
+
+    Say "Массовый опрос по списку: $RemoteSpec"
+
+    $ln = 0
+
+    foreach ($line in (Get-Content $RemoteSpec -Encoding UTF8)) {
+
+      $ln++
+
+      $t = "$line".Trim()
+
+      if (-not $t -or $t.StartsWith('#')) { continue }
+
+      $c = $t -split ';'
+
+      $cu = ("{0}" -f $c[0]).Trim(); $ch = ("{0}" -f $c[1]).Trim()
+
+      $cp = if ($c.Count -gt 2) { ("{0}" -f $c[2]).Trim() } else { "" }
+
+      $cpt = if ($c.Count -gt 3 -and ("{0}" -f $c[3]).Trim()) { ("{0}" -f $c[3]).Trim() } else { "22" }
+
+      if (-not $cu -or -not $ch) { Say "Строка ${ln}: пропуск (нужны user и ip/hostname)"; continue }
+
+      Say "───────── [$ln] $cu@$ch`:$cpt"
+
+      $kv = Run-RemoteHost "$cu@$ch" $cpt $cp
+
+      if ($kv) { $KvsList += ,$kv }
+
+    }
+
+  } else {
+
+    # одиночный хост: user@ip[:порт]; пароль — из PC_PASS или интерактивно
+
+    $kv = Run-RemoteHost $RemoteSpec "" ""
+
+    if ($kv) { $KvsList += ,$kv } else { exit 2 }
+
+  }
+
+  if ($KvsList.Count -eq 0) { Say "Отчёты не созданы: ни один хост не доступен."; exit 2 }
+
+  function Get-K([hashtable]$h, [string]$k) { if ($h.ContainsKey($k)) { "$($h[$k])" } else { '' } }
+
+  $okN = 0
+
+  foreach ($h in $KvsList) {
+
+    $HostName   = Get-K $h 'HOST'
+
+    $OSName     = Get-K $h 'OS_NAME'
+
+    $OSVer      = Get-K $h 'OS_VER'
+
+    $Arch       = Get-K $h 'ARCH'
+
+    $Bits       = Get-K $h 'BITS'
+
+    $userNow    = Get-K $h 'USER_NOW'
+
+    $DateNow    = Get-K $h 'DATE_NOW'
+
+    $Uptime     = Get-K $h 'UPTIME'
+
+    $SysVendor  = Get-K $h 'SYS_VENDOR'
+
+    $Virt       = Get-K $h 'ENV_TYPE'
+
+    $CpuModel   = Get-K $h 'CPU_MODEL';  $CpuVendor = Get-K $h 'CPU_VENDOR'
+
+    $CpuCores   = Get-K $h 'CPU_CORES';  $CpuThreads = Get-K $h 'CPU_THREADS'
+
+    $CpuMhz     = Get-K $h 'CPU_MHZ';    $SockCount = Get-K $h 'CPU_SOCKETS'
+
+    $CpuCache   = Get-K $h 'CPU_L3'
+
+    $Motherboard= Get-K $h 'MOTHERBOARD'; $MbVersion = Get-K $h 'MB_VERSION'
+
+    $BiosVer    = Get-K $h 'BIOS_VER';   $BiosDate = Get-K $h 'BIOS_DATE'
+
+    $RamTotal   = Get-K $h 'RAM_TOTAL';  $RamAvail = Get-K $h 'RAM_AVAIL'
+
+    $RamCount   = Get-K $h 'RAM_COUNT';  $RamSrc   = Get-K $h 'RAM_SRC'
+
+    $GpuName    = Get-K $h 'GPU_NAME';   $GpuBus   = Get-K $h 'GPU_BUS'
+
+    $GpuDrv     = Get-K $h 'GPU_DRV';    $GpuVram  = Get-K $h 'GPU_VRAM'
+
+    $RootDev    = Get-K $h 'ROOT_DEV';   $RootFs   = Get-K $h 'ROOT_FS'
+
+    $RootSize   = Get-K $h 'ROOT_SIZE';  $RootUsed = Get-K $h 'ROOT_USED'
+
+    $RootFree   = Get-K $h 'ROOT_FREE';  $RootPuse = Get-K $h 'ROOT_PUSE'
+
+    $DisksStr   = Get-K $h 'DISKS'
+
+    $PhysDisks  = Get-K $h 'PHYSICAL_DISKS'
+
+    $IfacesStr  = Get-K $h 'IFACES';     $DnsStr   = Get-K $h 'DNS'
+
+    $UsersLogin = Get-K $h 'USERS_LOGIN'; $UsersN  = Get-K $h 'USERS_ALL_N'
+
+    $OnlineN    = Get-K $h 'USERS_ONLINE'
+
+    $RemoteTag  = "удалённый сбор по SSH · $(Get-K $h '__SPEC')"
+
+    # ---- модули RAM: mfr|size|type|freq|part ----
+
+    $ramRows = @(); $i = 0
+
+    foreach ($m in (Get-K $h 'RAM_MODULES') -split ';') {
+
+      if (-not "$m".Trim()) { continue }
+
+      $i++; $p = $m -split '\|'
+
+      $ramRows += "<tr><td>#$i</td><td>$(Esc ("{0}" -f $p[0]))</td><td>$(Esc ("{0}" -f $p[4]))</td><td>$(Esc ("{0}" -f $p[1]))</td><td>$(Esc ("{0}" -f $p[2])) · $(Esc ("{0}" -f $p[3]))</td></tr>"
+
+    }
+
+    if ($ramRows.Count -eq 0) { $ramRows = @('<tr><td colspan="5">Данные о модулях недоступны (нет SMBIOS-информации)</td></tr>') }
+
+    # ---- видеокарта ----
+
+    $gpuCards = @( @"
+
+ <div class="card"><h3>$(Esc $GpuName) <span class="tag">$DASH</span></h3><table>
+
+ <tr><th>Полное наименование</th><td>$(Esc $GpuName)</td></tr>
+
+ <tr><th>Идентификатор шины</th><td>$(Esc $GpuBus)</td></tr>
+
+ <tr><th>Драйвер</th><td>$(Esc $GpuDrv)</td></tr>
+
+ <tr><th>Видеопамять</th><td>$(Esc $GpuVram)</td></tr>
+
+ </table></div>
+
+"@ )
+
+    $gpuMain = $GpuName; $gpuMainVram = $GpuVram
+
+    # ---- тома: dev|fs|size|used|free|pct|mount ----
+
+    $volCards = @(); $volCount = 0
+
+    foreach ($d in $DisksStr -split ';') {
+
+      if (-not "$d".Trim()) { continue }
+
+      $volCount++; $p = $d -split '\|'
+
+      $upRaw = "{0}" -f $p[5]; $upNum = 0
+
+      if ($upRaw -match '\d+') { $upNum = [int]$Matches[0] }
+
+      $cls = if ($upNum -gt 85) { 'crit' } elseif ($upNum -gt 65) { 'warn' } else { 'ok' }
+
+      $volCards += @"
+
+ <div class="card"><h3>$(Esc ("{0}" -f $p[6])) <span class="tag">$(Esc ("{0}" -f $p[0])) · $(Esc ("{0}" -f $p[1]))</span></h3><table>
+
+ <tr><th>Общий объём</th><td>$(Esc ("{0}" -f $p[2]))</td></tr>
+
+ <tr><th>Занято</th><td>$(Esc ("{0}" -f $p[3])) ($upNum%)</td></tr>
+
+ <tr><th>Свободно</th><td>$(Esc ("{0}" -f $p[4]))</td></tr>
+
+ </table><div class="bar"><div class="$cls" style="width:${upNum}%"></div></div></div>
+
+"@
+
+    }
+
+    if ($volCards.Count -eq 0) { $volCards = @('<div class="card"><h3>Тома</h3><p class="dim">Локальные тома не обнаружены</p></div>') }
+
+    # ---- физические диски ----
+
+    $prows = @()
+
+    foreach ($x in $PhysDisks -split ';') {
+
+      if (-not "$x".Trim()) { continue }
+
+      $prows += "<tr><td>$(Esc ("$x".Trim()))</td></tr>"
+
+    }
+
+    # ---- сеть: name|status|ips|mac|gw|mode|dns ----
+
+    $nicCards = @()
+
+    foreach ($n in $IfacesStr -split ';') {
+
+      if (-not "$n".Trim()) { continue }
+
+      $p = $n -split '\|'
+
+      $st = "{0}" -f $p[1]
+
+      $sc = if ("$st".ToUpper() -match 'UP') { 'green' } else { 'gray' }
+
+      $md = "{0}" -f $p[5]
+
+      $mc = if ("$md".ToUpper() -eq 'DHCP') { 'green' } else { 'amber' }
+
+      $nicCards += @"
+
+ <div class="card"><h3>$(Esc ("{0}" -f $p[0])) <span class="pill $sc">$(Esc $st)</span> <span class="pill $mc">$(Esc $md)</span></h3><table>
+
+ <tr><th>MAC-адрес</th><td>$(Esc ("{0}" -f $p[3]))</td></tr>
+
+ <tr><th>IPv4</th><td>$(Esc ("{0}" -f $p[2]))</td></tr>
+
+ <tr><th>Шлюз по умолчанию</th><td>$(Esc ("{0}" -f $p[4]))</td></tr>
+
+ <tr><th>DNS</th><td>$(Esc ("{0}" -f $p[6]))</td></tr>
+
+ </table></div>
+
+"@
+
+    }
+
+    if ($nicCards.Count -eq 0) { $nicCards = @('<div class="card"><h3>Сеть</h3><p class="dim">Активные интерфейсы не обнаружены</p></div>') }
+
+    # ---- пользователи ----
+
+    $userPills = @()
+
+    foreach ($u in ($UsersLogin -split ',\s*')) { if ("$u".Trim()) { $userPills += '<span class="pill blue">' + (Esc "$u".Trim()) + '</span>' } }
+
+    $allUsers = ($userPills -join '')
+
+    $RamTotalGb = $RamTotal
+
+    $RamFreeGb  = $RamAvail
+
+    $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
+
+    $safeHost = ($HostName -replace '[^\w\-]','_')
+
+    $OutputFile = if ($Output -and $KvsList.Count -eq 1) { $Output } else { "PC_Report_${safeHost}_${ts}.html" }
+
+    $ModeLine = " <span>РЕЖИМ: <b>$RemoteTag</b></span>"
+
+    $os = @{ LastBootUpTime = (Get-Date).AddSeconds(-1 * ([double](("{0}" -f $Uptime) -replace '[^\d.]','0' + '0'))) }
+
+    $html = $LocalTemplate
+
+    Set-Content -Path $OutputFile -Value $html -Encoding UTF8
+
+    $okN++
+
+    Say "✅ Отчёт создан: $OutputFile"
+
+  }
+
+  Say "Итог: отчётов создано — $okN из $($KvsList.Count)."
+
+  exit 0
+
+}
 
 Say "Сбор сведений о системе..."
 
@@ -404,10 +1254,6 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
 
 '@
 
-
-
-# ---------- Имя файла ----------
-
 if (-not $Output) {
 
   $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -421,6 +1267,7 @@ if (-not $Output) {
 
 
 $volCount = $vols.Count
+
 
 $html = @"
 
@@ -458,6 +1305,8 @@ $CSS
 
  <span>ПОЛЬЗОВАТЕЛЬ: <b>$(Esc $userNow)</b></span>
 
+ $ModeLine
+
 </div>
 
 <div class="badges">
@@ -466,7 +1315,7 @@ $CSS
 
  <span class="badge">$(Esc $Arch) · $(Esc $Bits)</span>
 
- <span class="badge">$RamTotalGb ГБ RAM</span>
+ <span class="badge">$(Esc $RamTotalGb) RAM</span>
 
  <span class="badge">$CpuCores ядер</span>
 
@@ -512,7 +1361,7 @@ $CSS
 
  <tr><th>Аптайм</th><td>$Uptime</td></tr>
 
- <tr><th>Последняя загрузка</th><td>$($os.LastBootUpTime.ToString('dd.MM.yyyy HH:mm'))</td></tr>
+ <tr><th>Тип системы</th><td>$(Esc $Virt)</td></tr>
 
  </table></div>
 
@@ -536,7 +1385,9 @@ $CSS
 
  <tr><th>Логических процессоров</th><td>$CpuThreads</td></tr>
 
- <tr><th>Базовая частота</th><td>$CpuMhz МГц</td></tr>
+ <tr><th>Частота</th><td>$CpuMhz МГц</td></tr>
+
+ <tr><th>Кэш L3</th><td>$(Esc $CpuCache)</td></tr>
 
  </table></div>
 
@@ -580,15 +1431,15 @@ $CSS
 
  <div class="card"><h3>Итог</h3>
 
-  <div class="big-num">$RamTotalGb ГБ</div>
+  <div class="big-num">$(Esc $RamTotalGb)</div>
 
   <div style="margin-top:10px;font-size:13px">
 
    <div><span class="dim">Модулей установлено:</span> $RamCount</div>
 
-   <div><span class="dim">Свободно доступно:</span> $RamFreeGb ГБ</div>
+   <div><span class="dim">Свободно сейчас:</span> $(Esc $RamFreeGb)</div>
 
-   <div><span class="dim">Источник данных:</span> WMI Win32_PhysicalMemory</div>
+   <div><span class="dim">Источник данных:</span> $(Esc $RamSrc)</div>
 
   </div>
 
@@ -628,9 +1479,9 @@ $(($gpuCards) -join "`n")
 
 $(($volCards) -join "`n")
 
- <div class="card"><h3>Физические диски <span class="tag">$($pdisks.Count) шт.</span></h3>
+ <div class="card"><h3>Физические диски</h3>
 
-  <table><tr><th>Устройство</th><th>Модель</th><th>Объём</th><th>Интерфейс</th></tr>
+  <table><tr><th>Модель / объём / интерфейс</th></tr>
 
 $(($prows) -join "`n")
 
@@ -668,9 +1519,9 @@ $(($nicCards) -join "`n")
 
  </table></div>
 
- <div class="card"><h3>Локальные пользователи <span class="tag">всего аккаунтов: $($allUsers.Count)</span></h3>
+ <div class="card"><h3>Пользователи ПК <span class="tag">всего аккаунтов: $UsersN</span></h3>
 
- <div>$userPills</div>
+ <div>$allUsers</div>
 
  </div>
 
@@ -690,13 +1541,13 @@ $(($nicCards) -join "`n")
 
 <span class="p">&gt;</span> motherboard   → $(Esc $Motherboard)
 
-<span class="p">&gt;</span> ram           → ${RamTotalGb}GB · $RamCount module(s)
+<span class="p">&gt;</span> ram           → $(Esc $RamTotalGb) · $RamCount module(s)
 
 <span class="p">&gt;</span> gpu           → $(Esc $gpuMain) · VRAM: $(Esc $gpuMainVram)
 
-<span class="p">&gt;</span> volumes       → $volCount local volume(s)
+<span class="p">&gt;</span> volumes       → $volCount volume(s), root: $(Esc $RootDev) ($(Esc $RootFs), $(Esc $RootPuse) занято)
 
-<span class="p">&gt;</span> user          → $(Esc $userNow) · accounts: $($allUsers.Count)
+<span class="p">&gt;</span> user          → $(Esc $userNow) · accounts: $UsersN
 
 </pre></div></section>
 
@@ -714,9 +1565,10 @@ $(($nicCards) -join "`n")
 
 "@
 
+# ---- сохранить шаблон для удалённого режима ----
 
+$LocalTemplate = $html
 
 Set-Content -Path $Output -Value $html -Encoding UTF8
 
 Say "Отчёт создан: $Output"
-
