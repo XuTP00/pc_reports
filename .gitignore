@@ -1,7 +1,1 @@
-# Common compressed file
-*.zipnode_modules/
-.next/
-dist/
-build/
-*.log
-node_modules/
+(empty)

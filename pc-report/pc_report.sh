@@ -5,9 +5,14 @@
 #  Единственный исполняемый файл для Linux (bash 4+).
 #
 #  Локальный запуск:   ./pc_report.sh [-o файл.html]
-#  Удалённый запуск:   ./pc_report.sh user@host [-p порт] [-o файл.html]
-#                      (пароль — только через переменную PC_PASS или
-#                       интерактивный запрос; нигде не сохраняется)
+#  Удалённый запуск:   ./pc_report.sh -r user@ip[:порт] [-o файл.html]
+#                      пароль вводится в интерактивном режиме,
+#                      нигде не сохраняется (только RAM процесса)
+#  Массовый опрос:     ./pc_report.sh -r список.txt
+#                      формат строки: user ; ip/hostname ; password ; port
+#                      (port необязателен — по умолчанию 22; # — комментарий)
+#  Работает с удалёнными хостами Linux И Windows (OpenSSH + PowerShell).
+#  HTML-отчёты создаются рядом со скриптом (в текущей папке запуска).
 #
 #  Что делает:  определяет ОС, собирает полные сведения об
 #               ОС/железе/сети/пользователях и создаёт автономный
@@ -22,20 +27,23 @@ SSH_PORT="22"
 PASS="${PC_PASS:-}"
 RUN_MODE="local"
 
-usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 
+REMOTE_ARG=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o|--output) OUTPUT="$2"; shift 2 ;;
     -p|--port)   SSH_PORT="$2"; shift 2 ;;
+    -r|--remote) REMOTE_ARG="${2:-}"; RUN_MODE="remote"; shift 2 ;;
     -h|--help)   usage ;;
     *@*)         TARGET="$1"; RUN_MODE="remote"; shift ;;
     *) echo "Неизвестный параметр: $1 (см. --help)" >&2; exit 1 ;;
   esac
 done
-
 say() { printf '\033[1;36m[pc_report]\033[0m %s\n' "$1" >&2; }
 die() { printf '\033[1;31m[pc_report] ОШИБКА:\033[0m %s\n' "$1" >&2; exit 1; }
+
+[ "$RUN_MODE" = "remote" ] && [ -z "$REMOTE_ARG" ] && die "после -r укажите user@ip[:порт] или файл-список"
 
 TS=$(date '+%Y%m%d_%H%M%S')
 DATA_FILE=$(mktemp /tmp/.pcreport.XXXXXX)
@@ -316,57 +324,251 @@ exit 0
 COLLECT_EOF
 
 # ############################################################
+#  ## 1b. ВСТРОЕННЫЙ СБОРЩИК ДАННЫХ (Windows, PowerShell)    ##
+#  ##  Отправляется по SSH на удалённый Windows-хост.        ##
+#  ############################################################
+WIN_PS1=$(mktemp /tmp/.pcreport_win.XXXXXX)
+cat > "$WIN_PS1" <<'WINPS_EOF'
+$ErrorActionPreference='Continue'
+$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8
+function E($v){if($null -eq $v){''}else{([string]$v).Trim().Replace("`r"," ").Replace("`n"," ")}}
+function emit($k,$v){Write-Host ("`t"+$k+"`t"+(E $v))}
+function GB($b){if($b -gt 0){('{0:N1} ГБ' -f ($b/1GB))}else{'н/д'}}
+$os=Get-CimInstance Win32_OperatingSystem
+$cs=Get-CimInstance Win32_ComputerSystem
+emit HOST $cs.Name
+emit OS_NAME $os.Caption
+emit OS_VER ("{0} (сборка {1})" -f $os.Version,$os.BuildNumber)
+emit KERNEL $os.Version
+$arch=E $env:PROCESSOR_ARCHITECTURE; if(-not $arch){$arch=E $os.OSArchitecture}
+emit ARCH $arch
+$bits=if("$arch" -match '64'){'64-битная'}elseif("$arch" -match '86|32'){'32-битная'}else{'н/д'}
+emit BITS $bits
+emit USER_NOW ("{0}\{1}" -f $env:USERDOMAIN,$env:USERNAME)
+emit HOME_DIR $env:USERPROFILE
+$virt='физическая машина'
+try{$vm=Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+ if("$($vm.Manufacturer)" -match 'Microsoft|Google|Amazon|Xen|VMware|innotek'){
+   if((Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber -match 'VM-'){$virt='виртуальная машина (Hyper-V)'}else{$virt='возможно виртуальная (по производителю)'}}}catch{}
+emit ENV_TYPE $virt
+$up=((Get-Date)-$os.LastBootUpTime); emit UPTIME ('аптайм {0} дн. {1} ч. {2} мин.' -f $up.Days,$up.Hours,$up.Minutes)
+$cpus=@(Get-CimInstance Win32_Processor); $cpu=$cpus[0]
+emit CPU_MODEL $cpu.Name
+emit CPU_VENDOR $cpu.Manufacturer
+emit CPU_SOCKETS $cpus.Count
+emit CPU_CORES (($cpus|Measure-Object -Property NumberOfCores -Sum).Sum)
+emit CPU_THREADS (($cpus|Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum)
+emit CPU_MHZ $cpu.CurrentClockSpeed
+$L2=($cpus|Measure-Object -Property L2CacheSize -Sum).Sum
+$L3=($cpus|Measure-Object -Property L3CacheSize -Sum).Sum
+emit CPU_L3 "$(if($L3){[math]::Round($L3/1MB,1)}else{$L2}) МБ"
+emit CPU_FLAGS (E $cpu.SecondLevelAddressTranslationExtensions)
+$mb=Get-CimInstance Win32_BaseBoard
+emit MOTHERBOARD ("{0} {1}" -f $mb.Manufacturer,$mb.Product)
+emit MB_VERSION $mb.Version
+emit SYS_VENDOR $cs.Manufacturer
+$bios=Get-CimInstance Win32_BIOS
+emit BIOS_VER $bios.SMBIOSBIOSVersion
+emit BIOS_DATE $(try{$bios.ReleaseDate.ToString('dd.MM.yyyy')}catch{'н/д'})
+$mods=@(Get-CimInstance Win32_PhysicalMemory)
+$total=($mods|Measure-Object -Property Capacity -Sum).Sum
+if(-not $total){$total=$cs.TotalPhysicalMemory}
+emit RAM_TOTAL (GB $total)
+emit RAM_AVAIL (GB ($os.FreePhysicalMemory*1KB))
+$tm=@{20='DDR';21='DDR2';22='DDR3';24='DDR3';26='DDR4';34='DDR4';35='DDR5'}
+$rs=''
+foreach($m in $mods){
+ $mt=[int]$m.SMBIOSMemoryType
+ $tp=if($tm.ContainsKey($mt)){$tm[$mt]}else{E $m.MemoryType}
+ $fq=if($m.ConfiguredClockSpeed -gt 0){"$($m.ConfiguredClockSpeed) МГц"}else{"$($m.Speed) МГц"}
+ $rs+=("{0}|{1}|{2}|{3};" -f (E $m.Manufacturer),(GB $m.Capacity),$tp,$fq)}
+emit RAM_MODULES $rs
+emit RAM_COUNT $mods.Count
+emit RAM_SRC 'WMI Win32_PhysicalMemory'
+$gpus=@(Get-CimInstance Win32_VideoController)
+$gn='';$gv='';$gd=''
+foreach($g in $gpus){
+ $vg=[math]::Round($g.AdapterRAM/1GB,2)
+ $vt=if($vg -gt 0){"$vg ГБ"}else{'н/д (разделяемая)'}
+ $gn+=(E $g.Name)+" | "; $gv+=$vt+" | "; $gd+=(E $g.DriverVersion)+", "}
+emit GPU_NAME $(E ($gn.TrimEnd(' ','|')))
+emit GPU_VRAM $(E ($gv.TrimEnd(' ','|')))
+emit GPU_DRV $(E ($gd.TrimEnd(' ',',')))
+emit GPU_BUS (E $gpus[0].InterfaceType)
+$vols=@(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3')
+$ds=''
+foreach($v in $vols){
+ $uP=if($v.Size -gt 0){[math]::Round((($v.Size-$v.FreeSpace)/$v.Size)*100)}else{0}
+ $nm=if($v.VolumeName){E $v.VolumeName}else{'без имени'}
+ $ds+=("{0}|{1}|{2}|{3}|{4}%|{5}|" -f $v.DeviceID,(E $v.FileSystem),(GB $v.Size),(GB ($v.Size-$v.FreeSpace)),$uP,$nm)}
+emit DISKS $ds
+$rootVol=$vols|Where-Object{$_.DeviceID -eq ((E $env:SystemDrive)+'\\')}|Select-Object -First 1
+if(-not $rootVol -and $vols.Count){$rootVol=$vols[0]}
+if($rootVol){
+ $ruP=[math]::Round((($rootVol.Size-$rootVol.FreeSpace)/$rootVol.Size)*100)
+ emit ROOT_DEV $rootVol.DeviceID
+ emit ROOT_FS $rootVol.FileSystem
+ emit ROOT_SIZE (GB $rootVol.Size)
+ emit ROOT_USED (GB ($rootVol.Size-$rootVol.FreeSpace))
+ emit ROOT_FREE (GB $rootVol.FreeSpace)
+ emit ROOT_PUSE "$ruP%"
+}
+$prows=@()
+foreach($d in @(Get-CimInstance Win32_DiskDrive)){
+ $prows+=("{0}|{1}|{2}|{3};" -f $d.DeviceID,(E $d.Model),(GB $d.Size),(E $d.InterfaceType))}
+emit PHYSICAL_DISKS (-join $prows)
+$nics=@(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True')
+$ifc=''
+foreach($n in $nics){
+ $ipx=if($n.IPAddress){E ($n.IPAddress -join ' ')}else{'нет IPv4'}
+ $gwv=if($n.DefaultIPGateway){E ($n.DefaultIPGateway -join ' ')}else{'—'}
+ $md=if($n.DHCPEnabled){'DHCP (авто)'}else{'STATIC (ручная)'}
+ $ifc+=("{0}|{1}|{2}|{3}|{4};" -f (E $n.Description),(E $n.MACAddress),$ipx,$gwv,$md)}
+emit IFACES $ifc
+$dnss=@()
+foreach($n in $nics){if($n.DNSServerSearchOrder){$dnss+=$n.DNSServerSearchOrder}}
+emit DNS $(if($dnss){E ($dnss|Select-Object -Unique|Sort-Object -Unique)}else{'н/д'})
+$users=@(Get-CimInstance Win32_UserAccount -Filter 'LocalAccount=True'|Where-Object{$_.SIDType -eq 1})
+$ul=''
+foreach($u in $users){$ul+=(E $u.Name)+';'}
+emit USERS_LOGIN $ul
+emit USERS_ALL_N $users.Count
+$sess=@(Get-CimInstance Win32_LogonSession -Filter 'LogonType=2 OR LogonType=10' -ErrorAction SilentlyContinue)
+emit USERS_ONLINE ("активных интерактивных сессий: $($sess.Count)")
+emit DATE_NOW (Get-Date -Format 'dd.MM.yyyy HH:mm:ss')
+WINPS_EOF
+
+# ############################################################
 #  ## 2. ИСПОЛНЕНИЕ СБОРА: локально или по SSH               ##
 #  ############################################################
-ASKPASS=""
-ssh_run() {
-  if [ -n "$PASS" ]; then
-    ASKPASS=$(mktemp /tmp/.pcr_askpass.XXXXXX)
-    cat > "$ASKPASS" <<EOF
-#!/bin/sh
-echo "\$PC_PASS"
-EOF
-    chmod 700 "$ASKPASS"
-    SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid -w \
-      ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
-          -o LogLevel=ERROR -p "$SSH_PORT" "$TARGET" "$@" 2>/dev/null
-    rm -f "$ASKPASS"; ASKPASS=""
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ConnectTimeout=10)
+RUN_USER=""
+CUR_PASS=""
+OUTDIR="$(pwd)"
+
+# Пароль живёт только в памяти процесса; временный askpass-файл
+# существует лишь на время одной команды ssh и удаляется сразу.
+ssh_pass_run() { # $1..n = команда; пароль — из PCR_PW (или CUR_PASS)
+  local ap rc pwv="${PCR_PW:-$CUR_PASS}"
+  ap=$(mktemp /tmp/.pcr_ap.XXXXXX) || die "не удалось создать временный файл"
+  chmod 700 "$ap"
+  printf '#!/bin/sh\ncase $1 in\n *[Pp]assword*) printf "%%s\\n" "$PCR_PW" ;;\n *) printf "yes\\n" ;;\nesac\n' > "$ap"
+  if [ -t 0 ]; then
+    PCR_PW="$pwv" SSH_ASKPASS="$ap" SSH_ASKPASS_REQUIRE=force \
+      setsid -w ssh "${SSH_OPTS[@]}" -o UserKnownHostsFile=/dev/null -p "$SSH_PORT" "$RUN_USER" "$@" 2>/dev/null
+    rc=$?
   else
-    ssh -o BatchMode=yes -o ConnectTimeout=8 -p "$SSH_PORT" "$TARGET" "$@"
+    # stdin занят (pipe/файл с данными сборщика) — просим ssh читать его,
+    # а диалог авторизации отводим в /dev/null
+    PCR_PW="$pwv" SSH_ASKPASS="$ap" SSH_ASKPASS_REQUIRE=force \
+      setsid -w ssh "${SSH_OPTS[@]}" -o UserKnownHostsFile=/dev/null \
+          -o NumberOfPasswordPrompts=1 -p "$SSH_PORT" "$RUN_USER" "$@" <&0 2>/dev/null
+    rc=$?
   fi
+  rm -f "$ap"
+  return $rc
 }
 
-if [ "$RUN_MODE" = "local" ]; then
-  say "Сбор сведений о системе (локально, Linux)..."
-  bash "$COLLECT_SCRIPT" > "$DATA_FILE" 2>/dev/null || die "Сборщик данных завершился с ошибкой"
-else
-  command -v ssh >/dev/null || die "не найден клиент ssh — удалённый режим недоступен"
-  say "Подключение к $TARGET (порт $SSH_PORT)..."
-  if ! ssh_run true; then
-    if [ -z "$PASS" ]; then
-      say "Ключ SSH не подошёл — запрошу пароль (он нигде не сохраняется)."
-      printf 'Пароль пользователя %s: ' "${TARGET%%@*}"
-      read -rs PASS; echo
-      export PC_PASS="$PASS"
-      ssh_run true || die "не удалось войти на $TARGET"
-    else
-      die "не удалось войти на $TARGET"
-    fi
+ssh_key_run() { # проба без пароля (ключи из стандартных мест ~/.ssh/id_*)
+  ssh -o BatchMode=yes "${SSH_OPTS[@]}" -p "$SSH_PORT" "$RUN_USER" "$@" 2>/dev/null
+}
+
+# выполнение удалённой команды с учётом способа авторизации
+run_ssh() { # $@ = команда (stdin/stdout как у вызывающего)
+  if [ "${AUTH_MODE:-}" = "key" ]; then ssh_key_run "$@"; else ssh_pass_run "$@"; fi
+}
+
+# авторизация: сначала ключ, затем пароль (из списка/PC_PASS/интерактивно)
+authorize() { # $1=пароль или пусто
+  AUTH_MODE=""
+  if ssh_key_run true </dev/null >/dev/null 2>&1; then AUTH_MODE="key"; return 0; fi
+  local p="${1:-${PC_PASS:-}}"
+  if [ -z "$p" ] && [ -n "$CUR_PASS" ]; then p="$CUR_PASS"; fi
+  if [ -z "$p" ]; then
+    say "Ключ SSH не подошёл — запрошу пароль (он нигде не сохраняется)."
+    printf 'Пароль пользователя %s: ' "${RUN_USER%%@*}"
+    read -rs p; echo
   fi
-  REMOTE_OS="$(ssh_run "uname -s" 2>/dev/null || echo '?')"
-  [ "$REMOTE_OS" = "Linux" ] || die "удалённая ОС = '$REMOTE_OS'. Для Windows используйте pc_report.ps1 локально на том ПК."
-  say "Сбор сведений на удалённом хосте $TARGET..."
-  ssh_run "cat > /tmp/pcr_collect_$$.sh && chmod +x /tmp/pcr_collect_$$.sh && /tmp/pcr_collect_$$.sh; rc=\$?; rm -f /tmp/pcr_collect_$$.sh; exit \$rc" \
-    < "$COLLECT_SCRIPT" > "$DATA_FILE" || die "удалённый сборщик завершился с ошибкой"
-fi
-[ -s "$DATA_FILE" ] || die "пустой набор данных"
+  [ -n "$p" ] || { say "ПРОПУСК: нет пароля для $RUN_USER"; return 1; }
+  export PCR_PW="$p"
+  if ssh_pass_run true </dev/null >/dev/null 2>&1; then AUTH_MODE="pass"; return 0; fi
+  say "ПРОПУСК: вход на $RUN_USER не выполнен"
+  unset PCR_PW; return 1
+}
+
+run_remote_host() { # $1=user@host  $2=порт  $3=пароль(может быть пуст)
+  RUN_USER="$1"; SSH_PORT="$2"; CUR_PASS="$3"
+  command -v ssh >/dev/null || die "не найден клиент ssh — удалённый режим недоступен"
+  say "Подключение к $RUN_USER (порт $SSH_PORT)..."
+  authorize "$3" || return 1
+
+  local osline hostdisp hshort b64
+  osline="$(run_ssh uname -s </dev/null 2>/dev/null || echo '?')"
+  hostdisp="${RUN_USER##*@}"; hshort="${hostdisp%%.*}"
+  TS=$(date '+%Y%m%d_%H%M%S')
+
+  case "$osline" in
+    Linux)
+      say "Удалённая ОС: Linux. Сбор сведений..."
+      run_ssh 'cat > /tmp/pcr_collect_$$.sh && bash /tmp/pcr_collect_$$.sh; rc=$?; rm -f /tmp/pcr_collect_$$.sh; exit $rc' \
+        < "$COLLECT_SCRIPT" > "$DATA_FILE" 2>/dev/null
+      [ -s "$DATA_FILE" ] || { say "ПРОПУСК: ошибка удалённого сбора на $hostdisp"; return 1; }
+      TARGET_OS="Linux"
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      say "Удалённая ОС: Windows (OpenSSH). Сбор через PowerShell..."
+      # скрипт-сборщик передаётся base64-строкой внутри команды (без stdin),
+      # выполняется powershell.exe, временный файл удаляется сразу после
+      b64=$(base64 < "$WIN_PS1" | tr -d '\n\r ')
+      run_ssh "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"\$f=Join-Path \$env:TEMP 'pcr_win.ps1'; [IO.File]::WriteAllBytes(\$f,[Convert]::FromBase64String('$b64')); \& \$f; Remove-Item \$f -Force\"" \
+        </dev/null > "$DATA_FILE" 2>/dev/null
+      [ -s "$DATA_FILE" ] || { say "ПРОПУСК: сбор через PowerShell на $hostdisp не дал данных"; return 1; }
+      TARGET_OS="Windows"
+      ;;
+    *)
+      say "ПРОПУСК: нераспознанная удалённая ОС '$osline'"; return 1 ;;
+  esac
+
+  TARGET="$RUN_USER"
+  gen_and_save "$hshort" "$TS"
+  say "Готово по хосту $hostdisp."
+  return 0
+}
+
+parse_target() { # разбирает user@host[:порт] → глобальные P_USER/P_HOST/P_PORT
+  local spec="$1" port="" host user=""
+  case "$spec" in
+    *@*) user="${spec%%@*}"; host="${spec#*@}" ;;
+    *)   host="$spec" ;;
+  esac
+  if [[ "$host" == *:* ]]; then port="${host##*:}"; host="${host%:*}"; fi
+  P_USER="$user"; P_HOST="$host"; P_PORT="${port:-22}"
+}
+
+build_spec() { # $1=user $2=host $3=port → user@host[:port если не 22]
+  if [ "${3:-22}" = "22" ]; then printf '%s@%s' "$1" "$2"; else printf '%s@%s:%s' "$1" "$2" "$3"; fi
+}
+
+# ############################################################
+#  ## 3. ГЕНЕРАЦИЯ И СОХРАНЕНИЕ ОТЧЁТА                       ##
+#  ############################################################
+gen_and_save() { # $1=имя хоста для файла  $2=таймстемп
+  local name out
+  if [ -n "$OUTPUT" ]; then
+    out="$OUTPUT"
+  else
+    name=$(echo "${HOST:-$1}" | tr -c 'A-Za-z0-9._-' '_')
+    out="${OUTDIR}/PC_Report_${name}_${2}.html"
+  fi
+  build_file "$out"
+  say "Отчёт сохранён локально: $out"
+}
 
 esc() { local s="$1"; s="${s//&/&amp;}"; s="${s//</&lt;}"; s="${s//>/&gt;}"; s="${s//\"/&quot;}"; printf '%s' "$s"; }
 get() { awk -F'\t' -v k="$1" '$1==k{sub(/^[^\t]+\t/,""); print; exit}' "$DATA_FILE"; }
 
 # ---------- читаем данные ----------
 HOST=$(get HOST)
-[ -n "$OUTPUT" ] || OUTPUT="PC_Report_$(echo "${HOST:-PC}" | tr -c 'A-Za-z0-9._-' '_')_${TS}.html"
 OS_NAME=$(get OS_NAME);   OS_VER=$(get OS_VER);     KERNEL=$(get KERNEL)
 ARCH=$(get ARCH);         BITS=$(get BITS)
 USER_NOW=$(get USER_NOW); HOME_DIR=$(get HOME_DIR); ENV_TYPE=$(get ENV_TYPE)
@@ -381,6 +583,7 @@ RAM_COUNT=$(get RAM_COUNT); RAM_SRC=$(get RAM_SRC)
 GPU_NAME=$(get GPU_NAME); GPU_BUS=$(get GPU_BUS); GPU_DRV=$(get GPU_DRV); GPU_VRAM=$(get GPU_VRAM)
 ROOT_DEV=$(get ROOT_DEV); ROOT_FS=$(get ROOT_FS); ROOT_SIZE=$(get ROOT_SIZE)
 ROOT_USED=$(get ROOT_USED); ROOT_FREE=$(get ROOT_FREE); ROOT_PUSE=$(get ROOT_PUSE); DISKS=$(get DISKS)
+PHYS_DISKS=$(get PHYSICAL_DISKS)
 IFACES=$(get IFACES); DNS=$(get DNS)
 USERS_LOGIN=$(get USERS_LOGIN); USERS_ALL_N=$(get USERS_ALL_N); USERS_ONLINE=$(get USERS_ONLINE)
 DATE_NOW=$(get DATE_NOW)
@@ -448,7 +651,7 @@ cat << EOF
  <span>КОМПЬЮТЕР: <b>$(esc "$HOST")</b></span>
  <span>ДАТА ОТЧЁТА: <b>$DATE_NOW</b></span>
  <span>ПОЛЬЗОВАТЕЛЬ: <b>$(esc "$USER_NOW")</b></span>
-$([ "$RUN_MODE" = "remote" ] && printf ' <span>РЕЖИМ: <b>удалённый сбор по SSH %s</b></span>' "$(esc "$TARGET")")
+$([ "$RUN_MODE" = "remote" ] && printf ' <span>РЕЖИМ: <b>удалённый сбор по SSH %s (%s)</b></span>' "$(esc "${TARGET:-}")" "$(esc "${TARGET_OS:-Linux}")")
 </div>
 <div class="badges">
  <span class="badge">$(esc "$OS_NAME")</span>
@@ -545,18 +748,27 @@ $(echo "$RAM_MODULES" | tr ';' '\n' | awk -F'|' 'NF>=4{n++; printf "<tr><td>#%d<
 <section id="disk"><div class="wrap">
 <div class="sec-title"><span class="ico">💾</span><span class="num">06</span> Дисковое пространство</div>
 <div class="grid g2">
- <div class="card"><h3>Корневое устройство <span class="tag">$(esc "$ROOT_DEV")</span></h3><table>
- <tr><th>Блочное устройство (root)</th><td>$(esc "$ROOT_DEV")</td></tr>
- <tr><th>Файловая система</th><td>$(esc "$ROOT_FS")</td></tr>
- <tr><th>Общий объём</th><td>$(esc "$ROOT_SIZE")</td></tr>
- <tr><th>Занято</th><td>$(esc "$ROOT_USED") ($(esc "$ROOT_PUSE"))</td></tr>
- <tr><th>Свободно</th><td>$(esc "$ROOT_FREE")</td></tr>
- </table>
- <div class="bar"><div class="$BARCLASS" style="width:${PU}%"></div></div>
- </div>
+$(if [ "${TARGET_OS:-Linux}" = "Windows" ]; then
+  # Windows: карточка на каждый логический том (DISKS: DeviceID|FS|Size|Used|Use%|Label)
+  echo "$DISKS" | tr ';' '\n' | grep -v '^$' | awk -F'|' 'NF>=5{
+    p=$5; sub(/%/,"",p); cls=(p+0>85)?"crit":((p+0>65)?"warn":"ok")
+    lbl=(NF>=6 && $6!="")?$6:"без имени"
+    printf " <div class=\"card\"><h3>%s <span class=\"tag\">%s · %s</span></h3><table>\n", $1, $2, lbl
+    printf "<tr><th>Общий объём</th><td>%s</td></tr>\n<tr><th>Занято</th><td>%s (%s)</td></tr>\n", $3, $4, $5
+    printf "</table>\n <div class=\"bar\"><div class=\"%s\" style=\"width:%s%%\"></div></div>\n </div>\n", cls, p+0 }'
+else
+  # Linux: корневое устройство + физдиски
+  printf ' <div class="card"><h3>Корневое устройство <span class="tag">%s</span></h3><table>\n' "$(esc "$ROOT_DEV")"
+  printf ' <tr><th>Блочное устройство (root)</th><td>%s</td></tr>\n' "$(esc "$ROOT_DEV")"
+  printf ' <tr><th>Файловая система</th><td>%s</td></tr>\n' "$(esc "$ROOT_FS")"
+  printf ' <tr><th>Общий объём</th><td>%s</td></tr>\n' "$(esc "$ROOT_SIZE")"
+  printf ' <tr><th>Занято</th><td>%s (%s)</td></tr>\n' "$(esc "$ROOT_USED")" "$(esc "$ROOT_PUSE")"
+  printf ' <tr><th>Свободно</th><td>%s</td></tr>\n' "$(esc "$ROOT_FREE")"
+  printf ' </table>\n <div class="bar"><div class="%s" style="width:%s%%"></div></div>\n </div>\n' "$BARCLASS" "$PU"
+fi)
  <div class="card"><h3>Физические диски</h3>
-  <table><tr><th>Устройство</th><th>Модель</th><th>Объём</th><th>Тип</th></tr>
-$(echo "$DISKS" | tr ';' '\n' | awk -F'|' 'NF>=4{printf "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n", $1, $2, $3, $4}')
+  <table><tr><th>Устройство</th><th>Модель</th><th>Объём</th><th>Тип/Интерфейс</th></tr>
+$( { [ -n "$PHYS_DISKS" ] && printf '%s\n' "$PHYS_DISKS"; } | tr ';' '\n' | awk -F'|' 'NF>=4{printf "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n", $1, $2, $3, $4}')
   </table>
  </div>
 </div></div></section>
@@ -624,6 +836,43 @@ gen_body >> "$1"
 echo "</body></html>" >> "$1"
 }
 
-build_file "$OUTPUT"
-say "Отчёт создан: $OUTPUT"
-say "Готово. Открыть в браузере: file://$(realpath "$OUTPUT" 2>/dev/null || echo "$OUTPUT")"
+# ############################################################
+#  ## 4. ГЛАВНЫЙ ЗАПУСК                                      ##
+#  ############################################################
+if [ "$RUN_MODE" = "local" ]; then
+  say "Сбор сведений о системе (локально, Linux)..."
+  bash "$COLLECT_SCRIPT" > "$DATA_FILE" 2>/dev/null || die "Сборщик данных завершился с ошибкой"
+  [ -s "$DATA_FILE" ] || die "пустой набор данных"
+  TARGET_OS="Linux"
+  gen_and_save "$(hostname)" "$TS"
+else
+  OKC=0; FAILC=0
+  if [ -f "$REMOTE_ARG" ]; then
+    # ----- файл-список: user ; ip/hostname ; password ; port -----
+    say "Массовый опрос по списку: $REMOTE_ARG"
+    LINENO_=0
+    while IFS= read -r line || [ -n "$line" ]; do
+      LINENO_=$((LINENO_+1))
+      line=$(printf '%s' "$line" | tr -d '\r')
+      case "$line" in ''|\#*) continue ;; esac
+      u=$(printf '%s' "$line"  | awk -F';' '{gsub(/^[ \t]+|[ \t]+$/,"",$1); print $1}')
+      h=$(printf '%s' "$line"  | awk -F';' '{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}')
+      p=$(printf '%s' "$line"  | awk -F';' '{gsub(/^[ \t]+|[ \t]+$/,"",$3); print $3}')
+      pt=$(printf '%s' "$line" | awk -F';' '{gsub(/^[ \t]+|[ \t]+$/,"",$4); print $4}')
+      [ -z "$u" ] || [ -z "$h" ] && { say "Строка $LINENO_: пропуск (нужны user и ip/hostname)"; FAILC=$((FAILC+1)); continue; }
+      [ -z "$pt" ] && pt=22
+      echo "───────────── [$LINENO_] $u@$h:$pt"
+      if run_remote_host "$u@$h" "$pt" "$p"; then OKC=$((OKC+1)); else FAILC=$((FAILC+1)); fi
+    done < "$REMOTE_ARG"
+    unset PCR_PW
+    say "Итог: успешно $OKC, с ошибками $FAILC."
+    [ "$OKC" -gt 0 ] || exit 2
+  else
+    parse_target "$REMOTE_ARG"
+    [ -n "$P_USER" ] || P_USER="$(id -un)"
+    run_remote_host "$(build_spec "$P_USER" "$P_HOST" "$P_PORT")" "$P_PORT" "${PC_PASS:-}" || exit 2
+    unset PCR_PW
+  fi
+fi
+
+exit 0
