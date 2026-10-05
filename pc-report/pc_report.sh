@@ -530,10 +530,19 @@ run_remote_host() { # $1=user@host[:порт]  $2=порт  $3=пароль(мо
   say "Подключение к $RUN_USER (порт $SSH_PORT)..."
   authorize "$3" || return 1
 
-  local osline hostdisp hshort b64
-  osline="$(run_ssh uname -s </dev/null 2>/dev/null || echo '?')"
+  local osline hostdisp hshort b64 raw iswin
+  # 'uname -s' есть только в POSIX-шелле. В cmd.exe (default shell Windows
+  # OpenSSH) её нет — тогда спрашиваем версию через ver. Результат нормализуем
+  # к ASCII, чтобы кириллический вывод не мешал распознаванию.
+  raw="$(run_ssh 'uname -s 2>/dev/null || ver' </dev/null 2>/dev/null | tr -cd 'A-Za-z0-9.\n')"
+  osline="$(printf '%s\n' "$raw" | head -1)"
+  iswin=0
+  case "$(printf '%s' "$raw" | tr 'A-Z' 'a-z')" in *microsoft*windows*) iswin=1;; esac
+  [[ "$raw" =~ [0-9]+\.[0-9]{3,}\.[0-9]+ ]] && iswin=1
   hostdisp="${RUN_USER##*@}"; hshort="${hostdisp%%.*}"
   TS=$(date '+%Y%m%d_%H%M%S')
+
+  if [ "$iswin" = 1 ]; then osline="MINGW"; fi
 
   case "$osline" in
     Linux)
