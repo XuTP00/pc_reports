@@ -44,9 +44,7 @@ param(
 
   [string]$Output = "",
 
-  [string]$Remote = "",
-
-  [Alias("r")][string]$R = ""
+  [Parameter(Position=0)][Alias("r")][string]$Remote = ""
 
 )
 
@@ -620,7 +618,7 @@ function Run-RemoteHost([string]$Spec, [string]$Port, [string]$Password) {
 
 # ---------- выбор режима: локальный или удалённый (-r) ----------
 
-$RemoteSpec = if ($Remote) { $Remote } elseif ($R) { $R } else { "" }
+$RemoteSpec = if ($Remote) { $Remote } else { "" }
 
 if ($RemoteSpec) {
 
