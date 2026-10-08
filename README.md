@@ -101,32 +101,37 @@ sergey       ; srv.local      ; topsecret  ; 2222
 | Windows 10/11 | Включённая функция «OpenSSH Server» + PowerShell 5.1 (CIM-сборщик работает под обычным пользователем) |
 
 ## 📦 Сборка EXE-файла из `pc_report.ps1` (Windows)
-Скрипт можно упаковать в самостоятельный `pc_report.exe` — тогда отчёт будет генерироваться двойным кликом или запуском без PowerShell и без обхода политик выполнения. Нужен модуль **PS2EXE-GUI** (Ingo Karstein / Markus Scholtes).
-
-### Пошагово (PowerShell от администратора)
-
-**1. Разрешить выполнение локальных скриптов:**
-```powershell
-Set-ExecutionPolicy RemoteSigned
+Скрипт можно упаковать в самостоятельный `pc_report.exe` — тогда отчёт будет генерироваться двойным кликом или запуском без PowerShell и без обхода политик выполнения.
+### **1 Вариант** 
+Запускаем файл `create-exe.cmd` в папке с `pc-report.ps1` и если все совместимости подходят то видим следующие:
 ```
-
-**2. Установить и импортировать модуль PS2EXE:**
-```powershell
-Install-Module -Name PS2EXE -Scope CurrentUser   # если модуль ещё не установлен
-Import-Module -Name PS2EXE
-```
-
-**3. Скомпилировать exe (иконка — опционально, для неё положите `.ico` рядом со скриптом):**
-```powershell
-Invoke-PS2EXE .\pc_report.ps1 .\pc_report.exe -iconFile .\icon.ico
-# без иконки достаточно: Invoke-PS2EXE .\pc_report.ps1 .\pc_report.exe
-```
-
-### Ожидаемый вывод компиляции
-```text
+PC Report - EXE helper v2
+Creating console EXE in Windows PowerShell without profiles...
 PS2EXE-GUI v0.5.0.34 by Ingo Karstein, reworked and GUI support by Markus Scholtes
-PowerShell Desktop environment started...
-Reading input file C:\project\1\pc_report.ps1
+
+
+Reading input file C:\project\pc-report.ps1
 Compiling file...
-Output file C:\project\1\pc_report.exe written
+
+Output file C:\project\pc-report-build-500099846981419190336624ecb2683d.exe written
+SUCCESS: C:\project\pc-report.exe
+The EXE is not digitally signed. Signing scripts remains a separate operation.
 ```
+
+### **2 Вариант**
+Скрипт запускаем из cmd или powershell (Права Администратора не нужны):
+```
+.\create-exe.cmd
+PC Report - EXE helper v2
+Creating console EXE in Windows PowerShell without profiles...
+PS2EXE-GUI v0.5.0.34 by Ingo Karstein, reworked and GUI support by Markus Scholtes
+
+
+Reading input file C:\project\pc-report.ps1
+Compiling file...
+
+Output file C:\project\pc-report-build-500099846981419190336624ecb2684d.exe written
+SUCCESS: C:\project\pc-report.exe
+The EXE is not digitally signed. Signing scripts remains a separate operation.
+```
+### Если в папке со скриптом будет лежать файл иконки с именем `1.ico` то он будет добавлен к исполняемому файлу `pc-report.exe`
