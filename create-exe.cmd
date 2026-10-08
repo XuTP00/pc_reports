@@ -1,0 +1,20 @@
+@echo off
+setlocal DisableDelayedExpansion
+echo PC Report - EXE helper v2
+rem Only this compiler process uses Bypass; persistent policies are unchanged.
+rem Do not inherit PowerShell 7 module paths into Windows PowerShell 5.1.
+set "PSModulePath=%SystemRoot%\System32\WindowsPowerShell\v1.0\Modules"
+set "PCREPORT_BUILD_DIR=%~dp0"
+set "PCREPORT_POWERSHELL=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+if exist "%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe" set "PCREPORT_POWERSHELL=%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+if not exist "%PCREPORT_POWERSHELL%" (
+    echo ERROR: Windows PowerShell 5.1 is not available.
+    pause
+    exit /b 1
+)
+"%PCREPORT_POWERSHELL%" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $temp=$null; try { $builtin=[IO.Path]::Combine($PSHOME,'Modules'); $env:PSModulePath=$builtin; Import-Module -Name ([IO.Path]::Combine($builtin,'Microsoft.PowerShell.Security','Microsoft.PowerShell.Security.psd1')) -ErrorAction Stop; if ((Get-ExecutionPolicy) -ne 'Bypass') { throw 'A higher-priority execution policy blocks this build. Ask your administrator to approve PS2EXE; permanent policies have not been changed.' }; $dir=$env:PCREPORT_BUILD_DIR; $source=Join-Path $dir 'pc-report.ps1'; $output=Join-Path $dir 'pc-report.exe'; if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw 'pc-report.ps1 must be next to create-exe.cmd.' }; $roots=@($builtin); $documents=[Environment]::GetFolderPath('MyDocuments'); if ($documents) { $roots+=[IO.Path]::Combine($documents,'WindowsPowerShell','Modules') }; $programFiles=[Environment]::GetFolderPath('ProgramFiles'); if ($programFiles) { $roots+=[IO.Path]::Combine($programFiles,'WindowsPowerShell','Modules') }; $env:PSModulePath=$roots -join [IO.Path]::PathSeparator; $candidates=@(Get-Module -ListAvailable -Name PS2EXE); $external=@(); if ($documents) { $external+=[IO.Path]::Combine($documents,'PowerShell','Modules','ps2exe') }; if ($programFiles) { $external+=[IO.Path]::Combine($programFiles,'PowerShell','Modules','ps2exe') }; foreach ($extra in $external) { if ([IO.Directory]::Exists($extra)) { foreach ($manifest in [IO.Directory]::GetFiles($extra,'ps2exe.psd1',[IO.SearchOption]::AllDirectories)) { $candidates+=@(Get-Module -ListAvailable -Name $manifest) } } }; $module=$candidates | Sort-Object Version -Descending | Select-Object -First 1; if (-not $module) { throw 'PS2EXE is not installed for this Windows account. Nothing has been downloaded or installed.' }; Import-Module -Name $module.Path -ErrorAction Stop; $temp=Join-Path $dir ('pc-report-build-'+[guid]::NewGuid().ToString('N')+'.exe'); $options=@{inputFile=$source;outputFile=$temp;ErrorAction='Stop'}; $icon=Join-Path $dir '1.ico'; if (Test-Path -LiteralPath $icon -PathType Leaf) { $options.iconFile=$icon }; Write-Host 'Creating console EXE in Windows PowerShell without profiles...'; Invoke-PS2EXE @options; if (-not (Test-Path -LiteralPath $temp -PathType Leaf)) { throw 'PS2EXE did not produce an EXE. The previous pc-report.exe has not been replaced.' }; $stream=[IO.File]::OpenRead($temp); try { if ($stream.Length -lt 64 -or $stream.ReadByte() -ne 77 -or $stream.ReadByte() -ne 90) { throw 'PS2EXE produced an invalid EXE. The previous pc-report.exe has not been replaced.' } } finally { $stream.Dispose() }; if (Test-Path -LiteralPath $output) { [IO.File]::Replace($temp,$output,[System.Management.Automation.Language.NullString]::Value) } else { [IO.File]::Move($temp,$output) }; Write-Host ('SUCCESS: '+$output); Write-Host 'The EXE is not digitally signed. Signing scripts remains a separate operation.' } catch { [Console]::Error.WriteLine('ERROR: '+$_.Exception.Message); exit 1 } finally { if ($temp -and (Test-Path -LiteralPath $temp)) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue } }"
+set "PCREPORT_BUILD_RESULT=%ERRORLEVEL%"
+echo.
+if not "%PCREPORT_BUILD_RESULT%"=="0" echo Build failed. Review the error above. No persistent execution policy was changed.
+pause
+exit /b %PCREPORT_BUILD_RESULT%
