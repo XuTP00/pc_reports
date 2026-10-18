@@ -23,7 +23,7 @@ sudo -E ./pc_report.sh   # рекомендуется для полных дан
 **Windows (PowerShell скрипт):**
 ```powershell
 cd <папка_с_файлом>
-powershell -ExecutionPolicy Bypass -File pc_report.ps1 # разрешит выполнение данного скрипта и создаст PC_Report_<хост>_<дата>.html
+powershell -ExecutionPolicy Bypass -File .\pc_report.ps1 # разрешит выполнение данного скрипта и создаст PC_Report_<хост>_<дата>.html
 ```
 **Windows (PowerShell скрипт #2):**
 ```powershell
